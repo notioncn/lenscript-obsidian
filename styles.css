@@ -4114,6 +4114,16 @@ body.is-mobile .gg-mm-root button.mm-tool:not(.is-active) .svg-icon {
   line-height: var(--om-line-height, 1.45);
   cursor: default;
   user-select: none;
+  -webkit-user-select: none;
+  /* 长按不要弹「拷贝/查询」系统菜单，否则手指还没拖动就被系统手势接管了 */
+  -webkit-touch-callout: none;
+  /* 节点里的 [[双链]] 是 <a>，不禁掉原生拖拽的话按下去会变成拖链接，指针事件全断 */
+  -webkit-user-drag: none;
+}
+
+.om-node a,
+.om-node .om-link {
+  -webkit-user-drag: none;
 }
 
 /* 标题卡片：文字 + marker 徽章；备注在它下面另起一块 */

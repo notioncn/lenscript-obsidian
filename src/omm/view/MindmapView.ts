@@ -676,6 +676,8 @@ export class MindmapView extends ItemView {
       onFreeDrop: (id, dx, dy) => this.commitFreeDrag(id, dx, dy),
       onFreeCancel: () => this.cancelFreeDrag(),
       onFreeRelease: () => this.releaseFreeDrag(),
+      scale: () => this.canvas.zoom,
+      autoPan: (x, y) => this.autoPan(x, y),
     })
 
     // 关联线：从节点右缘的小圆点拖到另一个节点，松手即建立一条关联
@@ -2732,6 +2734,29 @@ export class MindmapView extends ItemView {
     this.setSelection(nextId)
     this.draw()
     this.reveal(nextId)
+  }
+
+  /**
+   * 拖到视口边缘时缓缓平移画布。
+   *
+   * 不这么做的话，想拖到屏幕外的节点只能先松手、缩小画布、再拖一次——
+   * 长距离搬运全靠运气，这也是「拖拽不稳」的一部分。
+   */
+  private autoPan(x: number, y: number): boolean {
+    const rect = this.canvas.viewportRect()
+    if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return false
+    const edge = 44
+    const max = 14
+    let dx = 0
+    let dy = 0
+    if (x < rect.left + edge) dx = ((rect.left + edge - x) / edge) * max
+    else if (x > rect.right - edge) dx = -((x - (rect.right - edge)) / edge) * max
+    if (y < rect.top + edge) dy = ((rect.top + edge - y) / edge) * max
+    else if (y > rect.bottom - edge) dy = -((y - (rect.bottom - edge)) / edge) * max
+    if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return false
+    // user=false：自动平移不进「用户视野」记忆，免得拖一次就把布局位置写进设置
+    this.canvas.panBy(dx, dy, false)
+    return true
   }
 
   /** 拖拽落点（M6）。结构变更本身全在 core/tree.ts 的 `moveSubtree` / `mergeIntoNode` 里。 */

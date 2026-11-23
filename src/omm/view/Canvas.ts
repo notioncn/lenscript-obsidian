@@ -242,6 +242,11 @@ export class Canvas {
     if (dx !== 0 || dy !== 0) this.panBy(dx, dy, false)
   }
 
+  /** 当前缩放：拖拽命中容差、自由拖动位移都要按它换算成布局坐标。 */
+  get zoom(): number {
+    return this.scale
+  }
+
   zoomBy(factor: number): void {
     this.zoomAt(factor, this.width / 2, this.height / 2)
   }

@@ -118,5 +118,15 @@ test("拖回上级：父 / 祖父都算上级，兄弟不算", () => {
   assert.equal(resolveDrop(tree, a1a.id, { id: a.id, zone: "into" })?.parentId, a.id)
 })
 
+test("命中容差按屏幕像素换算：缩小时仍能吸附到节点旁", () => {
+  const boxes = new Map<string, { x: number; y: number; w: number; h: number }>([
+    ["a", { x: 0, y: 0, w: 200, h: 40 }],
+  ])
+  // 指针在节点下方 15 个布局像素：100% 缩放下超出 12 的容差
+  assert.equal(hitTest(["a"], boxes, 100, 55, "h", undefined, 12).id, null)
+  // 缩到 50% 时同样的屏幕距离对应 24 个布局像素，仍然吸附
+  assert.equal(hitTest(["a"], boxes, 100, 55, "h", undefined, 24).id, "a")
+})
+
 console.log(`\n${passed} passed, ${failed} failed`)
 if (failed > 0) process.exit(1)

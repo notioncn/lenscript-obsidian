@@ -33,10 +33,17 @@ export interface DropResult {
 
 /** 节点上下边缘各 25% 判为「插到前 / 后」，中间 50% 判为「成为子节点」。 */
 const EDGE_RATIO = 0.25
-/** 指针离最近节点超过这个距离（布局坐标）就算落在空白处。留一点容差，免得落在兄弟间隙里就变成建根。 */
+/**
+ * 指针离最近节点超过这个距离（屏幕像素）就算落在空白处。
+ * 视图按当前缩放换算成布局坐标传进来，缩放变了手感也不变。
+ */
 const HIT_TOLERANCE = 12
-/** 指针移动超过这个距离才算拖拽，否则仍是一次单击。 */
-const DRAG_THRESHOLD = 4
+/** 鼠标 / 触控板：移动超过这个距离才开始拖拽，否则仍是一次单击。 */
+const MOUSE_THRESHOLD = 6
+/** 手指比鼠标抖，阈值放大一点，免得轻点就变成拖拽。 */
+const TOUCH_THRESHOLD = 10
+/** 位移不到这个距离又没真正落到目标上，就当单击处理：不搬节点，也不吃掉 click。 */
+const TAP_SLOP = 10
 
 // ── 纯函数：落点判定 ─────────────────────────────────────────────
 
@@ -71,6 +78,7 @@ export function hitTest(
   y: number,
   orientation: 'h' | 'v' = 'h',
   ignore?: ReadonlySet<string>,
+  tolerance = HIT_TOLERANCE,
 ): DropTarget {
   let bestId: string | null = null
   let bestBox: Box | null = null
@@ -89,7 +97,7 @@ export function hitTest(
     if (d === 0) break
   }
 
-  if (bestId === null || bestBox === null || bestDist > HIT_TOLERANCE) {
+  if (bestId === null || bestBox === null || bestDist > tolerance) {
     return { id: null, zone: 'into' }
   }
   return { id: bestId, zone: zoneOf(bestBox, x, y, orientation) }
@@ -213,6 +221,13 @@ export interface DragHooks {
   onFreeDrop?: (id: string, dx: number, dy: number) => void
   /** 自由拖动被取消（Esc / 手势中断）：把预览位置还原。 */
   onFreeCancel?: () => void
+  /** 当前画布缩放：命中容差按屏幕像素换算，缩放后手感一致。 */
+  scale?: () => number
+  /**
+   * 拖到视口边缘自动平移画布：长距离拖拽不该因为「拖不出屏幕」而中断。
+   * 返回这一帧是否真的平移了，控制器会据此继续排下一帧。
+   */
+  autoPan?: (clientX: number, clientY: number) => boolean
   /** 自由拖动最终变成了结构落点：清掉预览快照，不写 %%float%%。 */
   onFreeRelease?: () => void
 }
@@ -226,8 +241,8 @@ export class DragController {
   private dragId: string | null = null
   /** 自由拖动中的节点（带 %%float%% 的独立节点）；null = 普通结构拖拽。 */
   private freeId: string | null = null
-  /** 自由拖动起点（布局坐标），每次拖拽只算一次。 */
-  private freeStart: { x: number; y: number } | null = null
+  /** 自由拖动开始时的缩放：位移按屏幕像素 ÷ 缩放换算，拖拽中平移 / 缩放画布不会让节点乱跳。 */
+  private freeScale = 1
   /** 最近一帧的布局坐标位移，松手时直接复用。 */
   private freeDelta = { dx: 0, dy: 0 }
   /** 自由拖动时要排除的子树（不参与 hitTest，否则只会命中自己）。 */
@@ -236,6 +251,12 @@ export class DragController {
   private draggingIds: ReadonlySet<string> = new Set()
   private startX = 0
   private startY = 0
+  /** 指针类型：手指和鼠标用不同的启动阈值。 */
+  private pointerType = 'mouse'
+  /** 这次按下后指针离起点的最远距离（屏幕像素）。 */
+  private moved = 0
+  /** 我们自己释放 pointer capture 时也会收到 lostpointercapture，用它区分。 */
+  private capturing = false
   /** 视口矩形在一次拖拽内不会变，开始时读一次就够——绝不逐节点、逐帧读。 */
   private rect: DOMRect | null = null
   private target: DropTarget = { id: null, zone: 'into' }
@@ -257,6 +278,10 @@ export class DragController {
     layer.addEventListener('pointermove', this.onPointerMove)
     layer.addEventListener('pointerup', this.onPointerUp)
     layer.addEventListener('pointercancel', this.onPointerCancel)
+    // 手指被系统抢走（来电、切后台、长按菜单）时 pointerup 不一定来，别让拖拽卡在半路
+    layer.addEventListener('lostpointercapture', this.onLostCapture)
+    window.addEventListener('blur', this.onWindowBlur)
+    document.addEventListener('visibilitychange', this.onVisibilityChange)
   }
 
   destroy(): void {
@@ -265,6 +290,9 @@ export class DragController {
     this.layer.removeEventListener('pointermove', this.onPointerMove)
     this.layer.removeEventListener('pointerup', this.onPointerUp)
     this.layer.removeEventListener('pointercancel', this.onPointerCancel)
+    this.layer.removeEventListener('lostpointercapture', this.onLostCapture)
+    window.removeEventListener('blur', this.onWindowBlur)
+    document.removeEventListener('visibilitychange', this.onVisibilityChange)
     this.indicator.remove()
   }
 
@@ -296,46 +324,69 @@ export class DragController {
   private readonly onPointerDown = (e: PointerEvent): void => {
     if (e.button !== 0 || this.pointerId !== null || !this.hooks.enabled()) return
     const el = (e.target as HTMLElement).closest<HTMLElement>('.om-node')
-    // 折叠按钮、关联线手柄、备注卡片都有自己的手势，不能一按就被当成要拖动节点
-    if (!el || (e.target as HTMLElement).closest('.om-toggle, .om-body-toggle, .om-rel-handle, .om-note')) return
+    // 折叠按钮、关联线手柄有自己的手势，不能一按就被当成要拖动节点。
+    // 备注卡片现在也算「拖这个节点」：正文长的节点，只让从标题拖会显得时灵时不灵。
+    if (!el || (e.target as HTMLElement).closest('.om-toggle, .om-body-toggle, .om-rel-handle')) return
     const id = el.dataset['nodeId']
     if (!id) return
 
     this.pointerId = e.pointerId
+    this.pointerType = e.pointerType
     this.candidate = id
     this.startX = e.clientX
     this.startY = e.clientY
+    this.moved = 0
   }
 
   private readonly onPointerMove = (e: PointerEvent): void => {
     if (this.pointerId !== e.pointerId) return
+    const dist = Math.hypot(e.clientX - this.startX, e.clientY - this.startY)
+    if (dist > this.moved) this.moved = dist
     if (!this.dragId) {
-      const moved = Math.abs(e.clientX - this.startX) + Math.abs(e.clientY - this.startY)
-      if (moved < DRAG_THRESHOLD) return
+      const threshold = this.pointerType === 'touch' ? TOUCH_THRESHOLD : MOUSE_THRESHOLD
+      if (dist < threshold) return
       if (!this.begin()) return
     }
     // 每帧只算一次落点：pointermove 可能一秒来上百个
     this.pending = { x: e.clientX, y: e.clientY }
-    if (this.frame === null) {
-      this.frame = window.requestAnimationFrame(() => {
-        this.frame = null
-        this.update()
-      })
-    }
+    this.schedule()
+  }
+
+  /** 下一帧算落点；已经在排队就不重复排。 */
+  private schedule(): void {
+    if (this.frame !== null) return
+    this.frame = window.requestAnimationFrame(() => {
+      this.frame = null
+      this.update()
+    })
   }
 
   private readonly onPointerUp = (e: PointerEvent): void => {
     if (this.pointerId !== e.pointerId) return
     const dragId = this.dragId
+    if (!dragId) {
+      this.reset()
+      return
+    }
+    // 松手这一下就是最终落点：不能沿用上一帧的命中结果。快速一甩就松手时，
+    // 上一帧可能还停在起点，落点会落到隔壁节点上——这就是「时准时不准」的来源。
+    this.pending = { x: e.clientX, y: e.clientY }
+    this.update()
     const result = this.result
     const target = this.target
     const { lastX, lastY } = this
     const freeId = this.freeId
     const freeDelta = this.freeDelta
-    const dragging = dragId !== null
+    // 抖一下、或者松手跑到视口外（工具栏、别的面板）：都不算一次落点
+    const tiny = this.moved < TAP_SLOP && target.id === null
+    const inside = this.insideViewport(e.clientX, e.clientY)
     this.reset()
-    if (!dragging || !dragId) return
-    this.dragged = true
+    this.dragged = !tiny && inside
+    if (tiny || !inside) {
+      // 自由拖动已经预览过位移，得还原；结构拖动本来就没动过节点
+      if (freeId) this.hooks.onFreeCancel?.()
+      return
+    }
     if (freeId) {
       // 落在别的节点身上 → 照常走结构落点（成为子节点 / 合并）；
       // 落在空白处 → 写回自由位置。
@@ -348,6 +399,29 @@ export class DragController {
       return
     }
     if (result) this.hooks.onDrop(dragId, result, target, lastX, lastY)
+  }
+
+  /** 松手点还在画布里吗——拖到工具栏 / 侧栏上松手不该把节点搬成独立块。 */
+  private insideViewport(x: number, y: number): boolean {
+    const rect = this.hooks.canvas.viewportRect()
+    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+  }
+
+  /**
+   * pointer capture 被系统收走（节点重绘、切后台、系统手势）：
+   * 之后的 pointermove / pointerup 都收不到，与其卡住不如干净地取消。
+   */
+  private readonly onLostCapture = (): void => {
+    if (!this.dragId || !this.capturing) return
+    this.cancel()
+  }
+
+  private readonly onWindowBlur = (): void => {
+    if (this.dragId) this.cancel()
+  }
+
+  private readonly onVisibilityChange = (): void => {
+    if (document.hidden && this.dragId) this.cancel()
   }
 
   private readonly onPointerCancel = (e: PointerEvent): void => {
@@ -371,7 +445,7 @@ export class DragController {
     const free = this.hooks.freeDrag?.(id) === true
     if (free) {
       this.freeId = id
-      this.freeStart = this.hooks.canvas.toContent(this.rect, this.startX, this.startY)
+      this.freeScale = this.hooks.scale?.() ?? 1
       this.freeDelta = { dx: 0, dy: 0 }
       this.hooks.canvas.viewport.classList.add('is-free-dragging')
       this.freeSubtree = subtreeIds(node)
@@ -379,6 +453,7 @@ export class DragController {
     }
     if (this.pointerId !== null && !this.layer.hasPointerCapture(this.pointerId)) {
       this.layer.setPointerCapture(this.pointerId)
+      this.capturing = true
     }
     this.hooks.canvas.viewport.classList.add('is-dragging')
     // 焦点收回导图：拖拽中按 Esc 要能取消（键盘在 MindmapView 上）
@@ -399,14 +474,36 @@ export class DragController {
     this.lastX = p.x
     this.lastY = p.y
 
+    const scale = this.hooks.scale?.() ?? 1
+    // 容差按屏幕像素算：缩到 50% 时不能要求用户把指针精确到 6 个屏幕像素
+    const tolerance = HIT_TOLERANCE / (scale || 1)
+
+    // 底部「独立」投放区优先：它盖在画布上，落在里面就不再按节点算（自由拖动的投放区已被隐藏）
+    const dock = this.hooks.independentRect?.()
+    if (!this.freeId && dock &&
+        p.x >= dock.left && p.x <= dock.right && p.y >= dock.top && p.y <= dock.bottom) {
+      this.target = { id: null, zone: 'independent' }
+      this.result = { parentId: null, index: 0 }
+      this.paint(true)
+      return
+    }
+
+    // 拖到视口边缘自动平移：远处的目标不该因为「拖不出屏幕」而够不着。
+    // 只在当前没有悬在节点上时平移——否则目标会被画布「抽走」，松手正好落空。
+    const panned = this.target.id === null && this.hooks.autoPan?.(p.x, p.y) === true
+
     // 自由拖动：只有位置，没有落点。每帧把位移交给视图平移子树。
-    if (this.freeId && this.freeStart) {
-      const point = this.hooks.canvas.toContent(this.rect, p.x, p.y)
-      this.freeDelta = { dx: point.x - this.freeStart.x, dy: point.y - this.freeStart.y }
+    if (this.freeId) {
+      // 位移按「屏幕像素 ÷ 起始缩放」算：拖拽途中平移 / 缩放画布，节点也不会乱跳
+      this.freeDelta = {
+        dx: (p.x - this.startX) / this.freeScale,
+        dy: (p.y - this.startY) / this.freeScale,
+      }
       this.hooks.onFreeMove?.(this.freeId, this.freeDelta.dx, this.freeDelta.dy)
 
       // 自由拖动的同时判定「有没有落在别的节点上」：
       // 落上节点就临时变成结构落点，松手按合并 / 成为子节点处理。
+      const point = this.hooks.canvas.toContent(this.rect, p.x, p.y)
       const hit = hitTest(
         this.hooks.order(),
         this.hooks.boxes(),
@@ -414,6 +511,7 @@ export class DragController {
         point.y,
         this.hooks.orientation?.() ?? 'h',
         this.freeSubtree ?? undefined,
+        tolerance,
       )
       this.target = hit
       if (hit.id === null) {
@@ -422,25 +520,36 @@ export class DragController {
         const vp = this.hooks.canvas.viewport
         vp.classList.remove('is-drop-invalid', 'is-drop-root')
         this.hooks.onVisual(this.empty, null)
+        if (panned) this.schedule()
         return
       }
       const result = resolveDrop(tree, this.freeId, hit)
       this.result = result
       this.paint(result !== null)
-      return
-    }
-
-    // 底部「独立」投放区优先：它盖在画布上，落在里面就不再按节点算
-    const dock = this.hooks.independentRect?.()
-    if (dock && p.x >= dock.left && p.x <= dock.right && p.y >= dock.top && p.y <= dock.bottom) {
-      this.target = { id: null, zone: 'independent' }
-      this.result = { parentId: null, index: 0 }
-      this.paint(true)
+      if (panned) this.schedule()
       return
     }
 
     const { x, y } = this.hooks.canvas.toContent(this.rect, p.x, p.y)
-    this.target = hitTest(this.hooks.order(), this.hooks.boxes(), x, y, this.hooks.orientation?.() ?? 'h')
+    this.target = hitTest(
+      this.hooks.order(),
+      this.hooks.boxes(),
+      x,
+      y,
+      this.hooks.orientation?.() ?? 'h',
+      undefined,
+      tolerance,
+    )
+    // 指针还在被拖节点自己身上：落点就是原地，既不该画插入线，也不该显示「禁止」
+    if (this.target.id === dragId) {
+      this.result = null
+      this.indicator.addClass('is-hidden')
+      this.hooks.canvas.viewport.classList.remove('is-drop-invalid', 'is-drop-root')
+      this.hooks.onIndependent?.(false)
+      this.hooks.onVisual(this.draggingIds, null)
+      if (panned) this.schedule()
+      return
+    }
     const result = resolveDrop(tree, dragId, this.target)
     // 原地放下不算一次移动，指示线照常给——用户看得见「放回原处」是有效操作。
     // 落到画布空白处是例外：那是「按落点自由摆放」，即使文档序没变也要执行。
@@ -448,6 +557,7 @@ export class DragController {
       ? null
       : result
     this.paint(result !== null)
+    if (panned) this.schedule()
   }
 
   private paint(valid: boolean): void {
@@ -484,8 +594,10 @@ export class DragController {
       this.frame = null
     }
     if (this.pointerId !== null && this.layer.hasPointerCapture(this.pointerId)) {
+      this.capturing = false
       this.layer.releasePointerCapture(this.pointerId)
     }
+    this.capturing = false
     if (this.dragId) this.hooks.onVisual(this.empty, null)
     this.hooks.onIndependent?.(false)
     const vp = this.hooks.canvas.viewport
@@ -496,7 +608,6 @@ export class DragController {
     this.candidate = null
     this.dragId = null
     this.freeId = null
-    this.freeStart = null
     this.freeSubtree = null
     this.freeDelta = { dx: 0, dy: 0 }
     this.draggingIds = this.empty
