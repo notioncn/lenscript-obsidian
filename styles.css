@@ -3994,6 +3994,18 @@ body.is-mobile .om-toolbar {
   background-color: var(--background-primary);
 }
 
+/* 旧版 gg 导图的工具条同理：移动端系统按钮外观会把图标吃掉 */
+body.is-mobile .gg-mm-root button.mm-tool:not(.is-active) {
+  color: var(--text-normal);
+  -webkit-appearance: none;
+  appearance: none;
+  background-color: transparent;
+}
+
+body.is-mobile .gg-mm-root button.mm-tool:not(.is-active) .svg-icon {
+  color: inherit !important;
+}
+
 .om-tool.is-active { color: var(--om-accent, var(--interactive-accent)); }
 .om-tool:disabled { cursor: default; opacity: 0.65; }
 .om-tool:focus-visible { outline: 2px solid var(--interactive-accent); outline-offset: 2px; }
