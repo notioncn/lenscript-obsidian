@@ -675,6 +675,7 @@ export class MindmapView extends ItemView {
       onFreeMove: (id, dx, dy) => this.previewFreeDrag(id, dx, dy),
       onFreeDrop: (id, dx, dy) => this.commitFreeDrag(id, dx, dy),
       onFreeCancel: () => this.cancelFreeDrag(),
+      onFreeRelease: () => this.releaseFreeDrag(),
     })
 
     // 关联线：从节点右缘的小圆点拖到另一个节点，松手即建立一条关联
@@ -2808,13 +2809,15 @@ export class MindmapView extends ItemView {
       .onClick(() => this.mergeInto(dragId, targetId, 'note')))
     menu.addItem(item => item.setTitle(t('menu.mergeText')).setIcon('merge')
       .onClick(() => this.mergeInto(dragId, targetId, 'text')))
+    // 松手时若只是弹菜单，先把自由拖动的预览位置还原，别让节点悬在半空
+    this.draw()
     menu.showAtPosition({ x, y })
   }
 
   /** 普通移动（成为子节点 / 重排）。 */
-  private moveTo(dragId: string, result: DropResult): void {
+  private moveTo(dragId: string, result: DropResult): MindNode | null {
     const tree = this.tree
-    if (!tree) return
+    if (!tree) return null
     // 同 startChild 的拦截，但要看整棵子树：标题层级跳跃被保留（A.3），
     // 父挪深一层可能把某个后代推过第 6 层。core 里的同名断言只是兜底。
     if (!this.host.settings.listNodes && !this.host.settings.orderedListNodes) {
@@ -2822,7 +2825,7 @@ export class MindmapView extends ItemView {
       const parentDepth = result.parentId === null ? 0 : (tree.byId.get(result.parentId)?.depth ?? 0)
       if (node && parentDepth + 1 + maxDepthDrop(node) >= 7) {
         new Notice(t('notice.listNodesRequired'))
-        return
+        return null
       }
     }
     let plan: EditPlan
@@ -2830,16 +2833,22 @@ export class MindmapView extends ItemView {
       plan = moveSubtree(tree, dragId, result.parentId, result.index, this.parseOptions())
     } catch (err) {
       this.report(err)
-      return
+      return null
     }
     // 换了一棵新树，被移动的节点要按结构位置重新找（它的 id 由 reconcile 保住，但对象是新的）
     const node = this.applyEdit(plan, (t) => resolveAt(t, result.parentId, result.index), tree.byId.get(dragId)?.text)
-    if (!node) return
-    // 放进一个折叠着的节点里，得让人看见结果
-    for (let p = node.parent; p; p = p.parent) p.collapsed = false
-    this.setSelection(node.id)
+    if (!node) return null
+    // 独立节点一旦有了明确的结构落点，就不该再带着 %%float%% 漂在父节点旁边
+    if (node.annotations?.float) {
+      this.writeAnnotation(node.id, (annotations) => { delete annotations.float })
+    }
+    // 放进一个折叠着的节点里，得让人看见结果；上面二次写回后要拿新树再展开
+    const fresh = this.tree?.byId.get(node.id) ?? node
+    for (let p = fresh.parent; p; p = p.parent) p.collapsed = false
+    this.setSelection(fresh.id)
     this.draw()
-    this.reveal(node.id)
+    this.reveal(fresh.id)
+    return fresh
   }
 
   /** 合并到任意目标节点：写回后把选中落在目标上。 */
@@ -3019,6 +3028,12 @@ export class MindmapView extends ItemView {
     this.setSelection(id)
     this.draw()
     this.canvas.focus()
+  }
+
+  /** 自由拖动转成了结构落点：清掉快照即可，不重画（结构变更自己会重画）。 */
+  private releaseFreeDrag(): void {
+    this.freeDragIds = null
+    this.freeDragBase = null
   }
 
   /** Esc / 手势中断：丢掉预览位移，回到文件里的位置。 */

@@ -5,6 +5,7 @@
 import assert from "node:assert/strict"
 import { parse } from "../src/omm/core/parser"
 import { layout } from "../src/omm/layout"
+import { hitTest } from "../src/omm/view/DragController"
 
 let passed = 0
 let failed = 0
@@ -80,6 +81,25 @@ test("自由主题的子树跟着一起平移", () => {
   const dy = b.y - bBase.y
   assert.ok(Math.abs((b1.x - b1Base.x) - dx) < 0.01, "子节点应跟随父节点同样的水平位移")
   assert.ok(Math.abs((b1.y - b1Base.y) - dy) < 0.01, "子节点应跟随父节点同样的垂直位移")
+})
+
+test("自由拖动排除自己后，能命中指针下面的其他节点", () => {
+  const boxes = new Map<string, { x: number; y: number; w: number; h: number }>([
+    ["self", { x: 0, y: 0, w: 200, h: 40 }],
+    ["other", { x: 0, y: 60, w: 200, h: 40 }],
+  ])
+  // 指针挪到 other 上；不排除自己时永远只会命中自己
+  const hit = hitTest(["self", "other"], boxes, 100, 80, "h", new Set(["self"]))
+  assert.equal(hit.id, "other")
+  assert.equal(hit.zone, "into")
+})
+
+test("没有独立节点时 hitTest 行为不变", () => {
+  const boxes = new Map<string, { x: number; y: number; w: number; h: number }>([
+    ["a", { x: 0, y: 0, w: 200, h: 40 }],
+  ])
+  const hit = hitTest(["a"], boxes, 100, 5, "h")
+  assert.equal(hit.id, "a")
 })
 
 console.log(`\n${passed} passed, ${failed} failed`)

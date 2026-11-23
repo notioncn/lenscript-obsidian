@@ -70,12 +70,14 @@ export function hitTest(
   x: number,
   y: number,
   orientation: 'h' | 'v' = 'h',
+  ignore?: ReadonlySet<string>,
 ): DropTarget {
   let bestId: string | null = null
   let bestBox: Box | null = null
   let bestDist = Infinity
 
   for (const id of order) {
+    if (ignore?.has(id)) continue
     const box = boxes.get(id)
     if (!box) continue
     const d = rectDistance(box, x, y)
@@ -198,6 +200,8 @@ export interface DragHooks {
   onFreeDrop?: (id: string, dx: number, dy: number) => void
   /** 自由拖动被取消（Esc / 手势中断）：把预览位置还原。 */
   onFreeCancel?: () => void
+  /** 自由拖动最终变成了结构落点：清掉预览快照，不写 %%float%%。 */
+  onFreeRelease?: () => void
 }
 
 export class DragController {
@@ -213,6 +217,8 @@ export class DragController {
   private freeStart: { x: number; y: number } | null = null
   /** 最近一帧的布局坐标位移，松手时直接复用。 */
   private freeDelta = { dx: 0, dy: 0 }
+  /** 自由拖动时要排除的子树（不参与 hitTest，否则只会命中自己）。 */
+  private freeSubtree: Set<string> | null = null
   /** 被拖走的整棵子树。开始时算一次，拖拽过程中不会变。 */
   private draggingIds: ReadonlySet<string> = new Set()
   private startX = 0
@@ -318,7 +324,14 @@ export class DragController {
     if (!dragging || !dragId) return
     this.dragged = true
     if (freeId) {
-      this.hooks.onFreeDrop?.(freeId, freeDelta.dx, freeDelta.dy)
+      // 落在别的节点身上 → 照常走结构落点（成为子节点 / 合并）；
+      // 落在空白处 → 写回自由位置。
+      if (target && target.id !== null && result) {
+        this.hooks.onFreeRelease?.()
+        this.hooks.onDrop(freeId, result, target, lastX, lastY)
+      } else {
+        this.hooks.onFreeDrop?.(freeId, freeDelta.dx, freeDelta.dy)
+      }
       return
     }
     if (result) this.hooks.onDrop(dragId, result, target, lastX, lastY)
@@ -348,6 +361,7 @@ export class DragController {
       this.freeStart = this.hooks.canvas.toContent(this.rect, this.startX, this.startY)
       this.freeDelta = { dx: 0, dy: 0 }
       this.hooks.canvas.viewport.classList.add('is-free-dragging')
+      this.freeSubtree = subtreeIds(node)
       this.hooks.onFreeStart?.(id)
     }
     if (this.pointerId !== null && !this.layer.hasPointerCapture(this.pointerId)) {
@@ -376,8 +390,30 @@ export class DragController {
     if (this.freeId && this.freeStart) {
       const point = this.hooks.canvas.toContent(this.rect, p.x, p.y)
       this.freeDelta = { dx: point.x - this.freeStart.x, dy: point.y - this.freeStart.y }
-      this.indicator.addClass('is-hidden')
       this.hooks.onFreeMove?.(this.freeId, this.freeDelta.dx, this.freeDelta.dy)
+
+      // 自由拖动的同时判定「有没有落在别的节点上」：
+      // 落上节点就临时变成结构落点，松手按合并 / 成为子节点处理。
+      const hit = hitTest(
+        this.hooks.order(),
+        this.hooks.boxes(),
+        point.x,
+        point.y,
+        this.hooks.orientation?.() ?? 'h',
+        this.freeSubtree ?? undefined,
+      )
+      this.target = hit
+      if (hit.id === null) {
+        this.result = null
+        this.indicator.addClass('is-hidden')
+        const vp = this.hooks.canvas.viewport
+        vp.classList.remove('is-drop-invalid', 'is-drop-root')
+        this.hooks.onVisual(this.empty, null)
+        return
+      }
+      const result = resolveDrop(tree, this.freeId, hit)
+      this.result = result
+      this.paint(result !== null)
       return
     }
 
@@ -408,10 +444,10 @@ export class DragController {
     this.hooks.onIndependent?.(independent)
     // 非法落点：不画指示线 + 光标变禁止符，落点在视觉上就是不可选的
     vp.classList.toggle('is-drop-invalid', !valid)
-    vp.classList.toggle('is-drop-root', valid && !independent && t.id === null)
+    vp.classList.toggle('is-drop-root', valid && !independent && t.id === null && !this.freeId)
 
     const box = valid && !independent && t.id !== null ? this.hooks.boxes().get(t.id) : undefined
-    this.hooks.onVisual(this.draggingIds, box && t.zone === 'into' ? t.id : null)
+    this.hooks.onVisual(this.freeId ? this.empty : this.draggingIds, box && t.zone === 'into' ? t.id : null)
     if (!box) {
       this.indicator.addClass('is-hidden')
       return
@@ -448,6 +484,7 @@ export class DragController {
     this.dragId = null
     this.freeId = null
     this.freeStart = null
+    this.freeSubtree = null
     this.freeDelta = { dx: 0, dy: 0 }
     this.draggingIds = this.empty
     this.rect = null
