@@ -5,7 +5,7 @@
 import assert from "node:assert/strict"
 import { parse } from "../src/omm/core/parser"
 import { layout } from "../src/omm/layout"
-import { hitTest, resolveDrop, targetIsAncestor } from "../src/omm/view/DragController"
+import { hitTest, isSamePosition, resolveDrop, targetIsAncestor } from "../src/omm/view/DragController"
 
 let passed = 0
 let failed = 0
@@ -126,6 +126,27 @@ test("命中容差按屏幕像素换算：缩小时仍能吸附到节点旁", ()
   assert.equal(hitTest(["a"], boxes, 100, 55, "h", undefined, 12).id, null)
   // 缩到 50% 时同样的屏幕距离对应 24 个布局像素，仍然吸附
   assert.equal(hitTest(["a"], boxes, 100, 55, "h", undefined, 24).id, "a")
+})
+
+test("带正文的大卡片，点标题算「放到节点上」而不是「插到前面」", () => {
+  const boxes = new Map<string, { x: number; y: number; w: number; h: number }>([
+    ["card", { x: 0, y: 0, w: 220, h: 120 }],
+  ])
+  // 标题在卡片顶部：以前按比例会被算成 before，合并菜单于是永远不出现
+  assert.equal(hitTest(["card"], boxes, 100, 30, "h").zone, "into")
+  assert.equal(hitTest(["card"], boxes, 100, 3, "h").zone, "before")
+  assert.equal(hitTest(["card"], boxes, 100, 115, "h").zone, "after")
+})
+
+test("拖回父节点身上：即使已经是最后一个子节点，落点依然有效", () => {
+  const tree = parse(["# 根", "", "## A", "", "### A1", "", "### A2", "", "## B", ""].join("\n"), OPTS)
+  const a = byText(tree, "A")
+  const a2 = byText(tree, "A2")
+  const result = resolveDrop(tree, a2.id, { id: a.id, zone: "into" })
+  assert.ok(result)
+  assert.equal(result.parentId, a.id)
+  // 文档序没变（原地），以前这里会被当成「原地不动」清掉，菜单自然不会出现
+  assert.equal(isSamePosition(tree, a2.id, result), true)
 })
 
 console.log(`\n${passed} passed, ${failed} failed`)

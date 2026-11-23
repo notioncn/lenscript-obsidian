@@ -31,8 +31,11 @@ export interface DropResult {
   index: number
 }
 
-/** 节点上下边缘各 25% 判为「插到前 / 后」，中间 50% 判为「成为子节点」。 */
+/** 小节点按上下各 25% 判「插到前 / 后」，中间判「放到节点上」。 */
 const EDGE_RATIO = 0.25
+/** 大节点（带正文卡片）只留一条窄边，否则点在标题上也会被判成「插到前面」。 */
+const EDGE_BAND_BEFORE = 10
+const EDGE_BAND_AFTER = 24
 /**
  * 指针离最近节点超过这个距离（屏幕像素）就算落在空白处。
  * 视图按当前缩放换算成布局坐标传进来，缩放变了手感也不变。
@@ -57,11 +60,16 @@ function rectDistance(box: Box, x: number, y: number): number {
 function zoneOf(box: Box, x: number, y: number, orientation: 'h' | 'v'): DropZone {
   // 横向布局：兄弟在竖直方向排队 → 按 y 分上中下；
   // 向下组织图：兄弟在水平方向排队 → 按 x 分左中右。
-  const r = orientation === 'v'
-    ? (box.w > 0 ? (x - box.x) / box.w : 0.5)
-    : (box.h > 0 ? (y - box.y) / box.h : 0.5)
-  if (r < EDGE_RATIO) return 'before'
-  if (r > 1 - EDGE_RATIO) return 'after'
+  const size = orientation === 'v' ? box.w : box.h
+  const pos = orientation === 'v' ? x - box.x : y - box.y
+  if (size <= 0) return 'into'
+  // 小节点：上下各 25%；带正文的大卡片：只留窄边。
+  // 统一按比例分的话，120px 高的卡片上，标题整块都落在「前面 25%」里——
+  // 明明点在标题上，却怎么都弹不出合并菜单。
+  const before = Math.min(size * EDGE_RATIO, EDGE_BAND_BEFORE)
+  const after = Math.min(size * EDGE_RATIO, EDGE_BAND_AFTER)
+  if (pos < before) return 'before'
+  if (pos > size - after) return 'after'
   return 'into'
 }
 
@@ -551,9 +559,14 @@ export class DragController {
       return
     }
     const result = resolveDrop(tree, dragId, this.target)
+    // 拖回上级「身上」即使文档序没变，也得把落点交给视图：那里要弹「成为子节点 / 合并」。
+    // 之前一律按「原地不动」清成 null，菜单自然永远不会出现（自己已经是父节点最后一个子节点时 100% 复现）。
+    const node = tree.byId.get(dragId)
+    const keepForMenu = this.target.id !== null && this.target.zone === 'into' && !!node &&
+      targetIsAncestor(node, this.target.id)
     // 原地放下不算一次移动，指示线照常给——用户看得见「放回原处」是有效操作。
     // 落到画布空白处是例外：那是「按落点自由摆放」，即使文档序没变也要执行。
-    this.result = result && this.target.id !== null && isSamePosition(tree, dragId, result)
+    this.result = result && this.target.id !== null && !keepForMenu && isSamePosition(tree, dragId, result)
       ? null
       : result
     this.paint(result !== null)

@@ -1,7 +1,7 @@
 {
   "id": "lenscript",
   "name": "镜语剧本编辑器",
-  "version": "0.7.4",
+  "version": "0.7.5",
   "minAppVersion": "1.7.2",
   "description": "一个插件融合 Markdown 剧本语义标签组、编辑器边缘大纲导轨、可完整编辑的 Markdown 思维导图、以及兼容 .nboard 的嵌套无限白板；白板可插入内嵌脑图或 .nestmind 文件。",
   "author": "fan1756",

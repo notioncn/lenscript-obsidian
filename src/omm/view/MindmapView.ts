@@ -73,7 +73,7 @@ import { Annotations } from './Annotations'
 import { AnnotationModal } from './AnnotationModal'
 import { Canvas } from './Canvas'
 import { Connectors } from './Connectors'
-import { DragController, resolveDrop, subtreeIds, targetIsAncestor, type DropResult, type DropTarget } from './DragController'
+import { DragController, isSamePosition, resolveDrop, subtreeIds, targetIsAncestor, type DropResult, type DropTarget } from './DragController'
 import { RelationDrag } from './RelationDrag'
 import { InlineEditor, BodyInlineEditor, type CommitNext } from './Editor'
 import { exportMap, ExportSizeError } from './exportMap'
@@ -2809,14 +2809,17 @@ export class MindmapView extends ItemView {
         }
         // 拖回上级时「成为子节点」只是换层 / 原地重排，默认设置直接搬走会让人摸不着合并入口；
         // 父节点再「成为子节点」等于排到末尾，没有意义，菜单里就只留合并
-        this.showDropMenu(dragId, target.id, x, y, !intoParent)
+        this.showDropMenu(dragId, target.id, x, y, !intoParent, true)
         return
       }
 
       if (intoAncestor) {
-        // 带子节点不能合并（要先给后代找去处），但设了「合并」的人得被告知一声，别以为合并成功了
-        if (action === 'mergeNote' || action === 'mergeText') new Notice(t('notice.mergeNeedsChildless'))
-      } else if (childless) {
+        // 带子节点：合并确实做不了（得先给后代找去处），但菜单照弹、把原因写在按钮上，
+        // 别让人以为「有时候有这个功能、有时候没有」
+        this.showDropMenu(dragId, target.id, x, y, true, false)
+        return
+      }
+      if (childless) {
         // 有子节点的节点不能合并（要先给后代找去处），直接成为子节点
         if (action === 'ask') {
           this.showDropMenu(dragId, target.id, x, y, true)
@@ -2835,8 +2838,15 @@ export class MindmapView extends ItemView {
     this.moveTo(dragId, result)
   }
 
-  /** 拖到节点身上时弹出的动作菜单。 */
-  private showDropMenu(dragId: string, targetId: string, x: number, y: number, canChild: boolean): void {
+  /** 拖到节点身上时弹出的动作菜单。`canMerge=false` 时合并按钮禁用并说明原因。 */
+  private showDropMenu(
+    dragId: string,
+    targetId: string,
+    x: number,
+    y: number,
+    canChild: boolean,
+    canMerge = true,
+  ): void {
     const tree = this.tree
     if (!tree) return
     const source = tree.byId.get(dragId)
@@ -2850,10 +2860,14 @@ export class MindmapView extends ItemView {
           if (result) this.moveTo(dragId, result)
         }))
     }
-    menu.addItem(item => item.setTitle(t('menu.mergeNote', target.text || source.text)).setIcon('sticky-note')
-      .onClick(() => this.mergeInto(dragId, targetId, 'note')))
-    menu.addItem(item => item.setTitle(t('menu.mergeText')).setIcon('merge')
-      .onClick(() => this.mergeInto(dragId, targetId, 'text')))
+    if (!canMerge) {
+      menu.addItem(item => item.setTitle(t('menu.mergeNeedsChildless')).setIcon('merge').setDisabled(true))
+    } else {
+      menu.addItem(item => item.setTitle(t('menu.mergeNote', target.text || source.text)).setIcon('sticky-note')
+        .onClick(() => this.mergeInto(dragId, targetId, 'note')))
+      menu.addItem(item => item.setTitle(t('menu.mergeText')).setIcon('merge')
+        .onClick(() => this.mergeInto(dragId, targetId, 'text')))
+    }
     // 松手时若只是弹菜单，先把自由拖动的预览位置还原，别让节点悬在半空
     this.draw()
     menu.showAtPosition({ x, y })
@@ -2872,6 +2886,11 @@ export class MindmapView extends ItemView {
         new Notice(t('notice.listNodesRequired'))
         return null
       }
+    }
+    // 菜单里点了「成为子节点」，但它本来就在那个位置：别为一次原地不动写文件、塞一条撤销记录
+    if (isSamePosition(tree, dragId, result)) {
+      this.draw()
+      return tree.byId.get(dragId) ?? null
     }
     let plan: EditPlan
     try {

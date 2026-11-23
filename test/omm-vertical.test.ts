@@ -126,9 +126,10 @@ test("向下连线的起点在父底边中点、终点在子顶边中点", () =>
 
 test("向下布局的拖拽落点按左右分区", () => {
   const boxes = new Map([["a", { x: 100, y: 100, w: 100, h: 40 }]])
-  assert.equal(hitTest(["a"], boxes, 110, 120, "v").zone, "before")
+  // 左右各留一条窄带（不按比例）：宽卡片中间整块都算「放到节点上」
+  assert.equal(hitTest(["a"], boxes, 105, 120, "v").zone, "before")
   assert.equal(hitTest(["a"], boxes, 150, 120, "v").zone, "into")
-  assert.equal(hitTest(["a"], boxes, 190, 120, "v").zone, "after")
+  assert.equal(hitTest(["a"], boxes, 195, 120, "v").zone, "after")
 })
 
 console.log(`\n${passed} passed, ${failed} failed`)
