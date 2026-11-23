@@ -1,0 +1,244 @@
+/**
+ * 顶部工具栏（M7）。主页面与侧边栏两种形态共用同一个 MindmapView，工具栏自然也共用。
+ *
+ * 三条约束：
+ * - 【不抢键盘焦点】。焦点一旦落到按钮上，M5 那条「全键盘」链路就断了，
+ *   所以 pointerdown 一律 preventDefault，动作跑完还要 afterAction() 把焦点还给画布。
+ * - 【事件委托】。整条工具栏只挂 2 个监听器，按钮做什么写在 data-action 上。
+ * - 【精简态】。缩回后只留适应画布 / 撤销 / 重做 / 缩回展开四个按钮，竖排贴右侧；
+ *   其余按钮与分组线由 CSS 藏起来，DOM 不重建，行为与快捷键不受影响。
+ */
+
+import { setIcon } from 'obsidian'
+import { t, type MsgKey } from '../i18n'
+
+/** 工具栏需要的视图能力。视图不把自己整个交出去，只交出这几件事。 */
+export interface ToolbarHooks {
+  fit(): void
+  zoom(factor: number): void
+  toggleLock(): void
+  /** 打开样式窗口（M8）。 */
+  openStyle(): void
+  /** 阅读 / 编辑模式互换。 */
+  toggleMode(): void
+  /** 展开 / 收起全部节点的备注（一个按钮切换）。 */
+  toggleBodies(): void
+  /** 就地搜索（标题 + 正文）。 */
+  search(): void
+  undo(): void
+  redo(): void
+  /** 折叠层级菜单，锚在按钮上。 */
+  foldLevel(anchor: HTMLElement): void
+  /** 分支方向菜单（右 / 左 / 两侧）。 */
+  direction(anchor: HTMLElement): void
+  /** 把当前选中的节点（或整张图）移到视野中心。 */
+  center(): void
+  /** 导出菜单（SVG / PNG / PDF）。 */
+  exportAs(anchor: HTMLElement): void
+  /** 一键主题预设菜单。 */
+  theme(anchor: HTMLElement): void
+  /** 背诵模式开关：遮住 ==高亮==，点一下揭开。 */
+  recite(): void
+  /** 每个动作之后把键盘焦点还给画布。 */
+  afterAction(): void
+}
+
+/** 一次点击的缩放倍率。与滚轮缩放的手感无关，按钮要「一下就看得出变化」。 */
+const ZOOM_STEP = 1.25
+
+interface ButtonSpec {
+  action: string
+  icon?: string
+  label?: MsgKey
+  /** 分隔线：只画一条竖线，不占按钮位。 */
+  separator?: boolean
+  /** 精简态仍保留的按钮。 */
+  keep?: boolean
+}
+
+const BUTTONS: readonly ButtonSpec[] = [
+  { action: 'mode', icon: 'book-open', label: 'tool.readMode' },
+  { action: 'recite', icon: 'glasses', label: 'tool.recite' },
+  { action: 'bodies', icon: 'eye', label: 'tool.bodies' },
+  { action: 'sep-1', separator: true },
+  { action: 'search', icon: 'search', label: 'tool.search' },
+  { action: 'undo', icon: 'undo-2', label: 'tool.undo', keep: true },
+  { action: 'redo', icon: 'redo-2', label: 'tool.redo', keep: true },
+  { action: 'sep-2', separator: true },
+  { action: 'fold', icon: 'layers', label: 'tool.foldLevel' },
+  { action: 'direction', icon: 'git-fork', label: 'tool.direction' },
+  { action: 'sep-3', separator: true },
+  { action: 'fit', icon: 'maximize', label: 'tool.fit', keep: true },
+  { action: 'zoom-out', icon: 'zoom-out', label: 'tool.zoomOut' },
+  { action: 'zoom-in', icon: 'zoom-in', label: 'tool.zoomIn' },
+  { action: 'center', icon: 'crosshair', label: 'tool.center' },
+  { action: 'sep-4', separator: true },
+  { action: 'lock', icon: 'lock-open', label: 'tool.lock' },
+  { action: 'style', icon: 'palette', label: 'tool.style' },
+  { action: 'theme', icon: 'paintbrush', label: 'tool.theme' },
+  { action: 'export', icon: 'download', label: 'tool.export' },
+  { action: 'compact', icon: 'chevrons-right', label: 'tool.toolbarCompact', keep: true },
+]
+
+export class Toolbar {
+  readonly el: HTMLElement
+  private lock!: HTMLButtonElement
+  private mode!: HTMLButtonElement
+  private reciteBtn!: HTMLButtonElement
+  private bodiesBtn!: HTMLButtonElement
+  private compactBtn!: HTMLButtonElement
+  private compact = false
+
+  constructor(
+    private readonly host: HTMLElement,
+    private readonly hooks: ToolbarHooks,
+  ) {
+    this.el = host.createDiv({ cls: 'om-toolbar' })
+    for (const spec of BUTTONS) this.addButton(spec)
+
+    this.el.addEventListener('pointerdown', this.onPointerDown)
+    this.el.addEventListener('click', this.onClick)
+  }
+
+  destroy(): void {
+    this.el.removeEventListener('pointerdown', this.onPointerDown)
+    this.el.removeEventListener('click', this.onClick)
+    this.el.remove()
+    this.host.removeClass('om-toolbar-compact')
+  }
+
+  private addButton(spec: ButtonSpec): HTMLElement {
+    if (spec.separator) return this.el.createDiv({ cls: 'om-tool-sep' })
+    const btn = this.el.createEl('button', { cls: 'om-tool' })
+    btn.type = 'button'
+    if (spec.keep) btn.addClass('is-compact-keep')
+    if (spec.action === 'lock') this.lock = btn
+    if (spec.action === 'mode') this.mode = btn
+    if (spec.action === 'recite') this.reciteBtn = btn
+    if (spec.action === 'bodies') this.bodiesBtn = btn
+    if (spec.action === 'compact') this.compactBtn = btn
+    btn.dataset['action'] = spec.action
+    // Obsidian 用 aria-label 显示气泡提示，顺便也是无障碍名字
+    if (spec.label) btn.setAttribute('aria-label', t(spec.label))
+    if (spec.icon) setIcon(btn, spec.icon)
+    return btn
+  }
+
+  /** 完整 ⇄ 精简。只切 class 与图标，按钮本身的监听器不动。 */
+  setCompact(compact: boolean): void {
+    if (compact === this.compact) return
+    this.compact = compact
+    this.el.toggleClass('is-compact', compact)
+    this.host.toggleClass('om-toolbar-compact', compact)
+    setIcon(this.compactBtn, compact ? 'chevrons-left' : 'chevrons-right')
+    this.compactBtn.setAttribute('aria-label', t(compact ? 'tool.toolbarExpand' : 'tool.toolbarCompact'))
+    this.compactBtn.setAttribute('aria-pressed', String(compact))
+    this.compactBtn.toggleClass('is-active', compact)
+  }
+
+  setLocked(locked: boolean, forced: boolean, available: boolean): void {
+    setIcon(this.lock, locked ? 'lock' : 'lock-open')
+    this.lock.disabled = forced || !available
+    this.lock.toggleClass('is-active', locked)
+    this.lock.setAttribute('aria-pressed', String(locked))
+    this.lock.setAttribute('aria-label', t(forced ? 'tool.readingLock' : locked ? 'tool.unlock' : 'tool.lock'))
+  }
+
+  /** 切换按钮跟着当前模式换图标与提示：显示「下一步会切到哪儿」。 */
+  setMode(readMode: boolean): void {
+    setIcon(this.mode, readMode ? 'pencil' : 'book-open')
+    this.mode.setAttribute('aria-label', t(readMode ? 'tool.editMode' : 'tool.readMode'))
+    this.mode.toggleClass('is-active', readMode)
+    this.mode.setAttribute('aria-pressed', String(readMode))
+  }
+
+  /** 背诵模式按钮的按下态。 */
+  setRecite(on: boolean): void {
+    this.reciteBtn.toggleClass('is-active', on)
+    this.reciteBtn.setAttribute('aria-pressed', String(on))
+  }
+
+  /** 没有备注的笔记里，这个开关没有意义，直接藏起来。 */
+  setHasBodies(has: boolean): void {
+    this.bodiesBtn.toggleClass('is-hidden', !has)
+  }
+
+  /** 备注按钮的按下态：全部展开时高亮，图标同步。 */
+  setBodiesOpen(open: boolean): void {
+    setIcon(this.bodiesBtn, open ? 'eye-off' : 'eye')
+    this.bodiesBtn.toggleClass('is-active', open)
+    this.bodiesBtn.setAttribute('aria-pressed', String(open))
+    this.bodiesBtn.setAttribute('aria-label', t(open ? 'tool.bodiesClose' : 'tool.bodies'))
+  }
+
+  /** 按下就阻止默认行为：否则浏览器会把焦点挪到按钮上，快捷键随即失效。 */
+  private readonly onPointerDown = (e: PointerEvent): void => {
+    e.preventDefault()
+  }
+
+  private readonly onClick = (e: MouseEvent): void => {
+    const btn = (e.target as HTMLElement).closest<HTMLElement>('.om-tool')
+    const action = btn?.getAttribute('data-action')
+    if (!action || !btn) return
+
+    switch (action) {
+      case 'mode':
+        this.hooks.toggleMode()
+        break
+      case 'bodies':
+        this.hooks.toggleBodies()
+        break
+      case 'recite':
+        this.hooks.recite()
+        break
+      case 'fit':
+        this.hooks.fit()
+        break
+      case 'search':
+        this.hooks.search()
+        return
+      case 'undo':
+        this.hooks.undo()
+        break
+      case 'redo':
+        this.hooks.redo()
+        break
+      case 'center':
+        this.hooks.center()
+        break
+      case 'fold':
+        this.hooks.foldLevel(btn)
+        return
+      case 'direction':
+        this.hooks.direction(btn)
+        return
+      case 'export':
+        this.hooks.exportAs(btn)
+        return
+      case 'theme':
+        this.hooks.theme(btn)
+        return
+      case 'zoom-in':
+        this.hooks.zoom(ZOOM_STEP)
+        break
+      case 'zoom-out':
+        this.hooks.zoom(1 / ZOOM_STEP)
+        break
+      case 'compact':
+        this.setCompact(!this.compact)
+        break
+      case 'lock':
+        if (!this.lock.disabled) this.hooks.toggleLock()
+        break
+      case 'style':
+        // 这里【不】走 afterAction：焦点得留给刚弹出来的窗口，
+        // 抢回画布的话窗口里的 Esc / Tab 就不听使唤了。关窗时 Obsidian 会把焦点还回来。
+        this.hooks.openStyle()
+        return
+      default:
+        break
+    }
+    this.hooks.afterAction()
+  }
+
+}

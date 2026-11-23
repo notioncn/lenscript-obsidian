@@ -1,0 +1,766 @@
+/**
+ * 结构操作 → EditPlan。严格实现 操作手册.md 附录 A 第 A.7 节。
+ *
+ * 本文件所有函数都是【纯函数】：不修改传入的树，只返回 EditPlan 或树里现成的节点引用。
+ * 写回由 doc/DocumentBridge 负责，且永远是最小范围替换（红线 2）。
+ *
+ * M5 在末尾追加了「选中移动」与「编辑意图 → EditPlan」两节：它们同样是纯逻辑，
+ * 放在这里就能被单测覆盖——键盘链路最容易错的部分因此不必靠手工点。
+ *
+ * 【禁止】import 任何 obsidian API。
+ */
+
+import type { EditPlan, MindNode, MindTree, NodeKind, ParseOptions, TextEdit } from './types'
+import { isBlank, isHeadingLine, listBaseDepthOf } from './parser'
+import { serializeNode, listMarker, serializeSubtree } from './serializer'
+import { serializeAnnotations, type NodeAnnotations } from './annotations'
+
+// ── 通用工具 ───────────────────────────────────────────────────
+
+function mustGet(tree: MindTree, id: string): MindNode {
+  const node = tree.byId.get(id)
+  if (!node) throw new Error(`节点不存在：${id}`)
+  return node
+}
+
+/** 节点文本不允许含换行——否则一行会被撑成多行，破坏所有行号映射。 */
+function assertSingleLine(text: string): void {
+  if (/[\r\n]/.test(text)) {
+    throw new Error(`节点文本不能包含换行符：${JSON.stringify(text)}`)
+  }
+}
+
+function isAncestorOf(maybeAncestor: MindNode, node: MindNode): boolean {
+  let p: MindNode | null = node.parent
+  while (p) {
+    if (p === maybeAncestor) return true
+    p = p.parent
+  }
+  return false
+}
+
+/**
+ * 最后一个非空行之后的位置。
+ *
+ * `splitLines` 会把「文件末尾的换行符」表示成数组最后一个空串元素，
+ * 在它之前插入才能保住原文件的末尾换行。
+ */
+function contentEnd(lines: string[]): number {
+  let e = lines.length
+  while (e > 0 && isBlank(lines[e - 1] ?? '')) e--
+  return e
+}
+
+/**
+ * 删除范围向后吞掉「分隔用」的空行。
+ *
+ * 只吞掉后面还有实际内容的那些空行；文件末尾的空行一律保留，
+ * 否则删掉最后一个节点会顺手删掉文件的末尾换行符。
+ */
+function swallowSeparators(lines: string[], end: number): number {
+  let k = end
+  while (k < lines.length && isBlank(lines[k] ?? '')) k++
+  return k < lines.length ? k : end
+}
+
+/**
+ * 源范围向【前】吞掉分隔空行——仅当本块是文件里最后一块内容时。
+ *
+ * 平时分隔空行跟着前一块走（swallowSeparators 向后吞）就够了。但搬走文件的最后一块内容时
+ * 后面没有内容可吞（否则会删掉文件末尾换行），它【前面】那几个分隔空行就成了孤儿留在文件尾巴上；
+ * 而落点处又会补一份新的分隔空行。于是反复把同一个节点拖到画布空白，空行会一轮堆三个
+ * ——正是陷阱 8「严格换行不幂等」的同一类问题。向前收正好把这份分隔一起带走。
+ */
+function swallowLeadingSeparators(lines: string[], start: number, end: number): number {
+  // 后面还有内容 → 那些空行仍在两块之间充当分隔，不能动
+  for (let i = end; i < lines.length; i++) {
+    if (!isBlank(lines[i] ?? '')) return start
+  }
+  let k = start
+  while (k > 0 && isBlank(lines[k - 1] ?? '')) k--
+  return k
+}
+
+/** 新增 / 移动节点时，插入点处「删除源范围之后」实际相邻的行。 */
+function neighborLines(
+  lines: string[],
+  insertAt: number,
+  srcStart: number,
+  srcEnd: number,
+): { prev: string | null; next: string | null } {
+  let i = insertAt - 1
+  if (i >= srcStart && i < srcEnd) i = srcStart - 1
+  let j = insertAt
+  if (j >= srcStart && j < srcEnd) j = srcEnd
+  return {
+    prev: i >= 0 ? (lines[i] ?? null) : null,
+    next: j < lines.length ? (lines[j] ?? null) : null,
+  }
+}
+
+/**
+ * 严格换行（A.6）：只在【相邻的两个标题行之间】补足 3 个空行。
+ *
+ * 与 serializer 的 assemble 保持一致——标题与正文之间不插空行，
+ * 因此插入点前一行若是正文，就不加前导空行。
+ */
+function withSeparators(
+  block: string[],
+  lines: string[],
+  insertAt: number,
+  options: ParseOptions,
+  srcStart = -1,
+  srcEnd = -1,
+): string[] {
+  if (!options.strictLineBreak || block.length === 0) return block
+  const first = block[0] ?? ''
+  const last = block[block.length - 1] ?? ''
+  const { prev, next } = neighborLines(lines, insertAt, srcStart, srcEnd)
+
+  const head = isHeadingLine(first) && prev !== null && isHeadingLine(prev) ? ['', '', ''] : []
+  const tail = isHeadingLine(last) && next !== null && isHeadingLine(next) ? ['', '', ''] : []
+  return [...head, ...block, ...tail]
+}
+
+/** A.7.1 规则 2 / 3：越界深度与列表/marker 父节点强制为列表。其余情况由调用方给出倾向值。 */
+function forcedKind(depth: number, parent: MindNode | null, prefer: NodeKind): NodeKind {
+  if (depth >= 7) return 'list'
+  if (parent && parent.depth > 0 && (parent.kind === 'list' || parent.kind === 'marker')) return 'list'
+  return prefer
+}
+
+/**
+ * 子树里相对 `node` 的最大深度落差（自身为 0）。标题层级跳跃会被保留（A.3），
+ * 所以「父挪深一层」可能把某个后代推过第 6 层——预判得看整棵子树，不能只看根。
+ */
+export function maxDepthDrop(node: MindNode): number {
+  let max = 0
+  const walk = (n: MindNode): void => {
+    for (const c of n.children) {
+      max = Math.max(max, c.depth - n.depth)
+      walk(c)
+    }
+  }
+  walk(node)
+  return max
+}
+
+/**
+ * 「忽略列表节点」开着时，深度 ≥ 7 的节点没有可见的写法：列表语法会被解析回正文，
+ * 写进去就是一棵看不见的子树。所有会产生这种节点的操作都必须在这里拦下。
+ */
+function assertWithinHeadings(newDepth: number, drop: number, listNodes: boolean): void {
+  if (!listNodes && newDepth + drop >= 7) {
+    throw new Error(`目标位置深度将达到 ${newDepth + drop}，超过标题的 6 层上限`)
+  }
+}
+
+/** 新节点所在列表块的 listBaseDepth：最近标题祖先 depth + 1。 */
+function baseDepthUnder(parent: MindNode | null): number {
+  if (!parent) return 1
+  if (parent.kind === 'heading') return parent.depth + 1 // 虚拟 root depth 0 → 1
+  return listBaseDepthOf(parent)
+}
+
+// ── 正文（标题与第一个子节点之间的段落） ──────────────────────
+
+/**
+ * 正文的行号范围 `[start, end)`，已去掉首尾空行。
+ *
+ * 空正文返回 `start === end`（插入点），调用方不必再判断 null。
+ * 虚拟 root 没有标题行，返回空区间。
+ */
+function bodySpan(tree: MindTree, node: MindNode): { start: number; end: number } {
+  if (node.depth === 0) return { start: 0, end: 0 }
+  let start = node.titleLine + 1
+  let end = Math.max(start, node.bodyEnd)
+  while (start < end && isBlank(tree.lines[start] ?? '')) start++
+  while (end > start && isBlank(tree.lines[end - 1] ?? '')) end--
+  return { start, end }
+}
+
+/** 节点正文（原始 Markdown 行，行间用 `\n` 连接）。没有正文时返回空串。 */
+export function bodyTextOf(tree: MindTree, node: MindNode): string {
+  const { start, end } = bodySpan(tree, node)
+  return start >= end ? '' : tree.lines.slice(start, end).join('\n')
+}
+
+/** 节点是否有可展开的正文。 */
+export function hasBody(tree: MindTree, node: MindNode): boolean {
+  const { start, end } = bodySpan(tree, node)
+  return end > start
+}
+
+/**
+ * 改写节点正文。
+ *
+ * 只动正文所在的行区间：前后的空行、子节点、同级的其它块一个字节都不碰。
+ * 空正文时在两处之一插入——标题行之后（保持「标题行紧挨正文」的读法）。
+ */
+export function setBody(tree: MindTree, id: string, text: string): EditPlan {
+  const node = mustGet(tree, id)
+  if (node.depth === 0) throw new Error('根节点没有正文')
+  const { start, end } = bodySpan(tree, node)
+  const lines = text
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+$/, ''))
+  while (lines.length > 0 && isBlank(lines[0] ?? '')) lines.shift()
+  while (lines.length > 0 && isBlank(lines[lines.length - 1] ?? '')) lines.pop()
+
+  if (start < end) {
+    if (lines.length === 0) return [{ fromLine: start, toLine: end, lines: [] }]
+    return [{ fromLine: start, toLine: end, lines }]
+  }
+  if (lines.length === 0) return []
+  const at = node.titleLine + 1
+  return [{ fromLine: at, toLine: at, lines }]
+}
+
+// ── A.7.2 重命名 ───────────────────────────────────────────────
+/** 只替换 titleLine 一行，depth / kind 不变。 */
+export function renameNode(tree: MindTree, id: string, newText: string): EditPlan {
+  assertSingleLine(newText)
+  const node = mustGet(tree, id)
+  const orderedPrefix = node.kind === 'list' ? /^[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+/.exec(tree.lines[node.titleLine] ?? '')?.[0] : undefined
+  // 行尾注解（框 / 概要 / 标注）跟着节点走，改名不能把它们弄丢
+  const suffix = node.annotationsRaw ?? ''
+  return [
+    {
+      fromLine: node.titleLine,
+      toLine: node.titleLine + 1,
+      lines: [orderedPrefix === undefined
+        ? serializeNode(newText, node.depth, node.kind, listBaseDepthOf(node)) + suffix
+        : orderedPrefix + newText + suffix],
+    },
+  ]
+}
+
+// ── A.7.3 插入 ─────────────────────────────────────────────────
+
+/**
+ * 在参考节点之后插入同级节点。depth 与参考节点相同。
+ *
+ * kind：规则 2/3 优先，否则【沿用参考节点的 kind】。
+ * 手册 A.7.1 规则 5 说「新建节点默认 heading」，但那条是给「没有可参照的兄弟」
+ * 的场景准备的——在一个列表项旁边按回车却得到一个 `#### 标题`，既突兀也不是用户意图。
+ */
+function listInsertionEnd(tree: MindTree, node: MindNode): number {
+  let last = node
+  while (last.children.length) last = last.children[last.children.length - 1]!
+  const prefix = /^[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+/.exec(tree.lines[last.titleLine] ?? '')?.[0] ?? ''
+  const column = prefix.replace(/\t/g, '    ').length
+  for (let line = last.titleLine + 1; line < node.blockEnd; line++) {
+    const text = tree.lines[line] ?? ''
+    if (text.trim() && (/^[ \t]*/.exec(text)?.[0] ?? '').replace(/\t/g, '    ').length < column) return line
+  }
+  return node.blockEnd
+}
+
+export function insertSibling(
+  tree: MindTree,
+  refId: string,
+  text: string,
+  position: 'after',
+  options: ParseOptions,
+): EditPlan {
+  assertSingleLine(text)
+  if (position !== 'after') throw new Error(`不支持的插入位置：${position as string}`)
+  const ref = mustGet(tree, refId)
+  const kind = forcedKind(ref.depth, ref.parent, ref.kind)
+  const source = tree.lines[ref.titleLine] ?? ''
+  const orderedPrefix = kind === 'list' && options.orderedListNodes ? /^[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+/.exec(source)?.[0] : undefined
+  const line = orderedPrefix === undefined
+    ? serializeNode(text, ref.depth, kind, listBaseDepthOf(ref))
+    : orderedPrefix + text
+  const insertAt = ref.kind === 'list' && options.orderedListNodes ? listInsertionEnd(tree, ref) : ref.blockEnd
+  return [
+    {
+      fromLine: insertAt,
+      toLine: insertAt,
+      lines: withSeparators([line], tree.lines, insertAt, options),
+    },
+  ]
+}
+
+/**
+ * 在父节点的最后一个子节点之后插入子节点；父节点无子节点时插在 bodyEnd 处。
+ *
+ * kind：规则 2/3 优先；有已存在的子节点时沿用最后一个子节点的 kind（理由同 insertSibling），
+ * 否则按规则 5 取 heading。
+ */
+export function insertChild(
+  tree: MindTree,
+  parentId: string | null,
+  text: string,
+  position: 'last',
+  options: ParseOptions,
+  marker?: '1.' | '-',
+): EditPlan {
+  assertSingleLine(text)
+  if (position !== 'last') throw new Error(`不支持的插入位置：${position as string}`)
+  const parent = parentId === null ? tree.root : mustGet(tree, parentId)
+  const depth = parent.depth + 1
+  assertWithinHeadings(depth, 0, options.listNodes || !!options.orderedListNodes)
+  const lastChild = parent.children[parent.children.length - 1]
+  const firstList = marker ? parent.children.find(child => child.kind === 'list') : undefined
+  const kind = forcedKind(depth, parent, marker ? 'list' : lastChild ? lastChild.kind : 'heading')
+  const sample = tree.lines[(firstList ?? lastChild ?? parent).titleLine]
+  const inherited = listMarker(sample)
+  const fallback = (lastChild ?? parent).kind === 'list' ? inherited : options.deepListMarker ?? inherited
+  const listPrefix = /^[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+/.exec(tree.lines[parent.titleLine] ?? '')?.[0]
+  const indent = firstList ? /^[ \t]*/.exec(sample ?? '')?.[0] ?? '' : undefined
+  const line = kind === 'list' && (indent !== undefined || (options.orderedListNodes && listPrefix))
+    ? (indent ?? listPrefix!.replace(/[^\t]/g, ' ')) + (marker ?? fallback) + ' ' + text
+    : serializeNode(text, depth, kind, baseDepthUnder(parent), marker ?? fallback)
+
+  const insertAt = marker
+    ? firstList?.titleLine ?? (parent.kind === 'list' && options.orderedListNodes ? listInsertionEnd(tree, parent) : parent.bodyEnd)
+    : lastChild
+    ? lastChild.kind === 'list' && options.orderedListNodes ? listInsertionEnd(tree, lastChild) : lastChild.blockEnd
+    : parent.depth === 0
+      ? contentEnd(tree.lines)
+      : parent.bodyEnd
+
+  return [
+    {
+      fromLine: insertAt,
+      toLine: insertAt,
+      lines: withSeparators([line], tree.lines, insertAt, options),
+    },
+  ]
+}
+
+/** 新建自由根：追加到文件末尾，depth = 1，kind = heading。 */
+export function createRoot(tree: MindTree, text: string, options: ParseOptions): EditPlan {
+  assertSingleLine(text)
+  const insertAt = contentEnd(tree.lines)
+  const line = serializeNode(text, 1, 'heading', 1)
+  return [
+    {
+      fromLine: insertAt,
+      toLine: insertAt,
+      lines: withSeparators([line], tree.lines, insertAt, options),
+    },
+  ]
+}
+
+// ── 合并进父节点 ───────────────────────────────────────────────
+
+/**
+ * 合并方式。
+ *
+ * - `'note'`：子节点标题与正文成为父节点的正文（备注），父节点标题不变。
+ * - `'text'`：子节点标题文字并入父节点标题，正文同样成为父节点正文。
+ */
+export type MergeMode = 'note' | 'text'
+
+/**
+ * 保留原行的前缀（`## ` / `#s ` / `\t- ` …），只换掉标题文字。
+ *
+ * 合并要改写父节点的标题行，但缩进、有序列表编号、剧本 marker 都必须原样保住，
+ * 否则一次合并会顺手把格式冲掉。
+ */
+function lineWithText(tree: MindTree, node: MindNode, text: string): string {
+  const src = tree.lines[node.titleLine] ?? ''
+  // 行尾注解原样接回，避免合并 / 改标注时丢掉别的注解
+  const suffix = node.annotationsRaw ?? ''
+  if (node.kind === 'heading') {
+    const prefix = /^#{1,6}[ \t]+/.exec(src)?.[0] ?? `${'#'.repeat(Math.min(6, Math.max(1, node.depth)))} `
+    return prefix + text + suffix
+  }
+  if (node.kind === 'marker' && node.marker) return `#${node.marker} ${text}${suffix}`
+  const prefix = /^[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+/.exec(src)?.[0] ?? ''
+  return prefix + text + suffix
+}
+
+// ── 行尾注解（框 / 概要 / 标注）写回 ────────────────────────────
+
+/**
+ * 改写某个节点的行尾注解。
+ *
+ * 只动 titleLine 一行：文字、层级、子节点、正文一个字节都不碰。
+ * `annotations` 为 null 表示清空所有注解。
+ */
+export function setNodeAnnotations(tree: MindTree, id: string, annotations: NodeAnnotations | null): EditPlan {
+  const node = mustGet(tree, id)
+  if (node.depth === 0) throw new Error('根节点不能加标注')
+  // lineWithText 会接回旧注解；这里要去掉旧尾巴，换成新的
+  const base = node.annotationsRaw && node.annotationsRaw.length > 0
+    ? lineWithText(tree, { ...node, annotationsRaw: undefined }, node.text)
+    : lineWithText(tree, node, node.text)
+  const line = base + serializeAnnotations(annotations)
+  if (line === (tree.lines[node.titleLine] ?? '')) return []
+  return [{ fromLine: node.titleLine, toLine: node.titleLine + 1, lines: [line] }]
+}
+
+/**
+ * 把子节点合并进它的父节点。
+ *
+ * 只接受【叶子节点】：它若有后代，合并就得先给那些后代找去处，那是结构调整而不是合并，
+ * 交给用户显式处理（拖出来或先删掉）。
+ *
+ * 产出的 EditPlan 至多三段，互不重叠：
+ * 1. 改写父节点标题（仅 `'text'`）
+ * 2. 在父节点正文末尾插入合并进来的文字
+ * 3. 删掉子节点整块（连同其后的分隔空行）
+ */
+export function mergeIntoParent(
+  tree: MindTree,
+  childId: string,
+  mode: MergeMode,
+): EditPlan {
+  const parent = mustGet(tree, childId).parent
+  if (!parent || parent.depth === 0) throw new Error('根节点没有可合并的父节点')
+  return mergeIntoNode(tree, childId, parent.id, mode)
+}
+
+/**
+ * 把源节点合并进【任意目标节点】。
+ *
+ * 与 `mergeIntoParent` 的区别只是目标不再限定为父节点：拖到画布上任意节点都能合并。
+ * 仍然只接受【叶子节点】——有后代时合并要重新安置它们，那是结构调整而不是合并。
+ *
+ * 产出的 EditPlan 至多三段，互不重叠：
+ * 1. 改写目标标题（仅 `'text'`）
+ * 2. 在目标正文末尾插入合并进来的文字
+ * 3. 删掉源节点整块（连同其后的分隔空行）
+ */
+export function mergeIntoNode(
+  tree: MindTree,
+  sourceId: string,
+  targetId: string,
+  mode: MergeMode,
+): EditPlan {
+  const source = mustGet(tree, sourceId)
+  const target = mustGet(tree, targetId)
+  if (source === target) throw new Error('不能合并到自己')
+  if (source.children.length > 0) throw new Error('只能合并没有子节点的节点')
+  if (target.depth === 0) throw new Error('不能合并到虚拟根')
+  // 目标是源的后代：删掉源会把目标一起删掉
+  if (isAncestorOf(source, target)) throw new Error('不能把节点合并进自己的子树')
+
+  const sourceBody = tree.lines.slice(source.titleLine + 1, source.bodyEnd)
+  const plan: EditPlan = []
+
+  // 1) 目标标题：`'text'` 模式把源节点文字接在后面
+  if (mode === 'text') {
+    const head = target.text.trim()
+    const merged = head === '' ? source.text : `${head} ${source.text}`
+    assertSingleLine(merged)
+    plan.push({
+      fromLine: target.titleLine,
+      toLine: target.titleLine + 1,
+      lines: [lineWithText(tree, target, merged)],
+    })
+  }
+
+  // 2) 正文：`'note'` 模式把源节点标题也落成一行正文
+  const noteLines = mode === 'note' ? [source.text, ...sourceBody] : sourceBody
+  if (noteLines.length > 0) {
+    const at = target.bodyEnd
+    plan.push({ fromLine: at, toLine: at, lines: noteLines })
+  }
+
+  // 3) 删除源节点整块
+  plan.push({
+    fromLine: source.blockStart,
+    toLine: swallowSeparators(tree.lines, source.blockEnd),
+    lines: [],
+  })
+
+  return plan
+}
+
+// ── A.7.5 删除 ─────────────────────────────────────────────────
+
+/**
+ * 删除若干子树。先过滤掉「祖先已在删除列表中」的 id，再按 blockStart 升序合并相邻范围。
+ */
+export function removeSubtree(tree: MindTree, ids: string[]): EditPlan {
+  const nodes = ids.map((id) => mustGet(tree, id))
+  const tops = nodes.filter((n) => !nodes.some((other) => other !== n && isAncestorOf(other, n)))
+
+  // 去重（同一个 id 传两次）后按文档序排列
+  const uniq = [...new Set(tops)].sort((a, b) => a.blockStart - b.blockStart)
+
+  const plan: EditPlan = []
+  for (const n of uniq) {
+    const from = n.blockStart
+    const to = swallowSeparators(tree.lines, n.blockEnd)
+    const prev = plan[plan.length - 1]
+    if (prev && prev.toLine >= from) {
+      prev.toLine = Math.max(prev.toLine, to) // 相邻/接壤范围合并，避免产生重叠的 TextEdit
+    } else {
+      plan.push({ fromLine: from, toLine: to, lines: [] })
+    }
+  }
+  return plan
+}
+
+// ── A.7.4 移动子树 ─────────────────────────────────────────────
+
+/**
+ * 把 `id` 的整棵子树移到 `newParentId` 之下的第 `indexInParent` 个位置。
+ *
+ * - `newParentId === null` 表示移到虚拟 root 下（成为自由根，depth = 1、kind = heading）。
+ * - `indexInParent` 是在【剔除被移动节点之后】的兄弟数组中的下标。
+ * - 正文行随子树一起移动，且不做任何缩进调整（A.7.4 第 5 步）。
+ */
+export function moveSubtree(
+  tree: MindTree,
+  id: string,
+  newParentId: string | null,
+  indexInParent: number,
+  options: ParseOptions,
+): EditPlan {
+  const node = mustGet(tree, id)
+  const newParent = newParentId === null ? null : mustGet(tree, newParentId)
+
+  // 第 1 步：不能移到自身或自己的后代之下
+  if (newParent === node) throw new Error('不能把节点移到它自己之下')
+  if (newParent && isAncestorOf(node, newParent)) {
+    throw new Error('不能把节点移到它自己的后代之下')
+  }
+
+  const parentNode = newParent ?? tree.root
+  const siblings = parentNode.children.filter((c) => c !== node)
+  if (!Number.isInteger(indexInParent) || indexInParent < 0 || indexInParent > siblings.length) {
+    throw new Error(`indexInParent 越界：${indexInParent}，兄弟数 ${siblings.length}`)
+  }
+
+  // 第 6 步：插入点（原始行号坐标系）。它只取决于目标位置，与源范围无关，故先算。
+  const prevSibling = indexInParent > 0 ? siblings[indexInParent - 1] : undefined
+  const insertAt = prevSibling
+    ? prevSibling.blockEnd
+    : parentNode.depth === 0 && parentNode.children.length === 0
+      ? contentEnd(tree.lines)
+      : parentNode.bodyEnd
+
+  // 第 2 步：源范围。默认把其后的分隔空行一起搬走，否则空行会在原地堆积。
+  //
+  // 但「外提」（把子节点变成父节点的下一个兄弟）时，插入点正是父节点的 blockEnd，
+  // 而那些空行同时也是父节点块的尾巴——贪心吞掉会把插入点吞进源范围里。
+  // 这种情形退回到不吞空行：那些空行马上就要充当新位置的分隔符，本来也不该动。
+  const blockStart = node.blockStart
+  const greedyEnd = swallowSeparators(tree.lines, node.blockEnd)
+  const srcEnd = insertAt > blockStart && insertAt < greedyEnd ? node.blockEnd : greedyEnd
+
+  // 搬走文件最后一块内容时连它【前面】的分隔空行一起收走，否则空行会累积（见上面的注释）。
+  // 同样地，插入点落在这些空行中间就退回去——那几行马上要当新位置的分隔符。
+  const greedyStart = swallowLeadingSeparators(tree.lines, blockStart, srcEnd)
+  const srcStart =
+    insertAt > greedyStart && insertAt <= blockStart ? blockStart : greedyStart
+
+  // 第 3、4 步：新的 depth 与 kind
+  const newDepth = newParent ? newParent.depth + 1 : 1
+  assertWithinHeadings(newDepth, maxDepthDrop(node), options.listNodes || !!options.orderedListNodes)
+  const newKind: NodeKind = newParent ? forcedKind(newDepth, newParent, node.kind) : 'heading'
+
+  // 第 5 步：重新序列化整棵子树（正文随行）
+  const block = serializeSubtree(
+    tree.lines,
+    node,
+    newDepth,
+    newKind,
+    baseDepthUnder(newParent),
+    options,
+    newParent?.kind === 'list' ? tree.lines[newParent.titleLine] : undefined,
+  )
+
+  // 第 7 步：插入点落在源范围【内部】即为非法
+  if (insertAt > srcStart && insertAt < srcEnd) {
+    throw new Error(`插入点 ${insertAt} 落在被移动的范围 [${srcStart}, ${srcEnd}) 内部`)
+  }
+
+  const del: TextEdit = { fromLine: srcStart, toLine: srcEnd, lines: [] }
+  const ins: TextEdit = {
+    fromLine: insertAt,
+    toLine: insertAt,
+    lines: withSeparators(block, tree.lines, insertAt, options, srcStart, srcEnd),
+  }
+  return [del, ins]
+}
+
+// ── 选中移动（M5）──────────────────────────────────────────────
+
+export type NavDirection = 'up' | 'down' | 'left' | 'right'
+
+/**
+ * 方向键的结果。折叠/展开会改 `collapsed`（那是视图状态），所以这里只返回【意图】，
+ * 由视图去执行——本文件保持纯函数。
+ */
+export type NavAction =
+  | { type: 'select'; id: string }
+  | { type: 'collapse'; id: string }
+  | { type: 'expand'; id: string }
+
+function indexIn(parent: MindNode, node: MindNode): number {
+  return parent.children.indexOf(node)
+}
+
+/**
+ * 方向键在树中移动选中。找不到去处返回 null。
+ *
+ * - ↑：上一个兄弟；没有则回到父节点
+ * - ↓：下一个兄弟；没有则找【最近的、还有下一个兄弟的祖先】的那个兄弟（跨出本支）
+ * - →：折叠着就展开；展开着就进第一个子节点
+ * - ←：展开着就折叠；已经是叶子或已折叠就回到父节点
+ *
+ * ↑ 与 ↓ 不完全互逆（↓ 会跨支、↑ 只回父）。这是有意的：
+ * ↑↓ 的主职责是「在同级里走」，跨支只是走到头之后的兜底，
+ * 而向上走到头时父节点就在正上方，回父比钻进上一支的最深处更符合直觉。
+ */
+export function navigate(tree: MindTree, id: string, dir: NavDirection): NavAction | null {
+  const node = tree.byId.get(id)
+  if (!node) return null
+  const parent = node.parent
+
+  switch (dir) {
+    case 'up': {
+      if (!parent) return null
+      const prev = parent.children[indexIn(parent, node) - 1]
+      if (prev) return { type: 'select', id: prev.id }
+      return parent.depth > 0 ? { type: 'select', id: parent.id } : null
+    }
+    case 'down': {
+      let cur: MindNode = node
+      while (cur.parent) {
+        const p: MindNode = cur.parent
+        const next = p.children[indexIn(p, cur) + 1]
+        if (next) return { type: 'select', id: next.id }
+        if (p.depth === 0) break // 已经到虚拟 root，没有更外层了
+        cur = p
+      }
+      return null
+    }
+    case 'right': {
+      if (node.children.length === 0) return null
+      if (node.collapsed) return { type: 'expand', id: node.id }
+      const first = node.children[0]
+      return first ? { type: 'select', id: first.id } : null
+    }
+    case 'left': {
+      if (node.children.length > 0 && !node.collapsed) return { type: 'collapse', id: node.id }
+      return parent && parent.depth > 0 ? { type: 'select', id: parent.id } : null
+    }
+  }
+}
+
+/**
+ * 删除某节点后，选中态该落到哪儿：前一个兄弟 → 父节点 → 后一个兄弟。
+ *
+ * 最后那档是给「删掉第一个根节点」准备的：它没有前兄弟，父节点又是不可选的虚拟 root。
+ */
+export function selectionAfterRemoval(tree: MindTree, id: string): string | null {
+  const node = tree.byId.get(id)
+  const parent = node?.parent
+  if (!node || !parent) return null
+  const i = indexIn(parent, node)
+  const prev = parent.children[i - 1]
+  if (prev) return prev.id
+  if (parent.depth > 0) return parent.id
+  const next = parent.children[i + 1]
+  return next ? next.id : null
+}
+
+/**
+ * 把选中提到最近的【可见】祖先上：节点本身没被折叠藏起来时返回它自己。
+ *
+ * 「折叠全部」（M7 工具栏）之后用得着——选中不能停在一个看不见的节点上，
+ * 否则接下来的方向键会从屏幕上根本不存在的地方开始走。
+ */
+export function visibleAncestor(tree: MindTree, id: string): string | null {
+  const node = tree.byId.get(id)
+  if (!node) return null
+  let visible = node
+  // 从自己往上找到【最外层】那个折叠着的祖先——中间还有折叠祖先时，内层那个也是看不见的
+  for (let p = node.parent; p && p.depth > 0; p = p.parent) {
+    if (p.collapsed) visible = p
+  }
+  return visible.id
+}
+
+// ── 编辑意图 → EditPlan（M5）───────────────────────────────────
+
+/**
+ * 一次节点编辑要做的事。视图只负责收集文字，翻译成 EditPlan 的活儿在这里，
+ * 于是「Enter 新增同级 → 输入 → 再 Enter」这条链路可以完全脱离 DOM 做单测。
+ */
+export type EditIntent =
+  | { type: 'rename'; id: string }
+  | { type: 'sibling'; refId: string }
+  | { type: 'child'; parentId: string | null; marker?: '1.' | '-' }
+  | { type: 'root' }
+
+export interface EditOutcome {
+  plan: EditPlan
+  /**
+   * 提交后，目标节点所在父节点的 id（null = 虚拟 root）与它在 children 里的下标。
+   *
+   * re-parse 会产出全新对象，新节点更是没有旧 id 可复用，
+   * 靠 (parentId, index) 这个【结构位置】才能在新树里重新找到它。
+   */
+  parentId: string | null
+  index: number
+}
+
+/** 节点所属父节点的 id；父是虚拟 root 时为 null。 */
+function parentIdOf(node: MindNode): string | null {
+  const p = node.parent
+  return p && p.depth > 0 ? p.id : null
+}
+
+/**
+ * 把一次编辑意图翻译成 EditPlan + 提交后的定位信息。
+ *
+ * 调用前必须先把【草稿节点】从树上摘掉：`insertChild` 要数父节点现有的子节点个数，
+ * 草稿混在里面会把插入点算到自己后面。
+ */
+export function planEdit(
+  tree: MindTree,
+  intent: EditIntent,
+  text: string,
+  options: ParseOptions,
+): EditOutcome {
+  switch (intent.type) {
+    case 'rename': {
+      const node = mustGet(tree, intent.id)
+      const parent = node.parent
+      return {
+        plan: node.text === text ? [] : renameNode(tree, intent.id, text),
+        parentId: parentIdOf(node),
+        index: parent ? indexIn(parent, node) : 0,
+      }
+    }
+    case 'sibling': {
+      const ref = mustGet(tree, intent.refId)
+      const parent = ref.parent
+      return {
+        plan: insertSibling(tree, intent.refId, text, 'after', options),
+        parentId: parentIdOf(ref),
+        index: parent ? indexIn(parent, ref) + 1 : 0,
+      }
+    }
+    case 'child': {
+      const parent = intent.parentId === null ? tree.root : mustGet(tree, intent.parentId)
+      return {
+        plan: insertChild(tree, intent.parentId, text, 'last', options, intent.marker),
+        parentId: intent.parentId,
+        index: intent.marker ? 0 : parent.children.length,
+      }
+    }
+    case 'root':
+      return {
+        plan: createRoot(tree, text, options),
+        parentId: null,
+        index: tree.root.children.length,
+      }
+  }
+}
+
+/** 按 (parentId, index) 在树里取节点。配合 planEdit 的返回值使用。 */
+export function resolveAt(tree: MindTree, parentId: string | null, index: number): MindNode | null {
+  const parent = parentId === null ? tree.root : (tree.byId.get(parentId) ?? null)
+  return parent?.children[index] ?? null
+}

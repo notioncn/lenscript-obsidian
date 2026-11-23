@@ -1,0 +1,28 @@
+{
+  "name": "lenscript-obsidian",
+  "version": "0.7.1",
+  "description": "Obsidian 插件：景启 AI 剧本编辑器",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production",
+    "test": "esbuild test/core.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-core-test.cjs && node /tmp/lenscript-core-test.cjs && esbuild test/outline.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-outline-test.cjs && node /tmp/lenscript-outline-test.cjs && esbuild test/format.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-format-test.cjs && node /tmp/lenscript-format-test.cjs && esbuild test/mindmap.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-mm-test.cjs && node /tmp/lenscript-mm-test.cjs && esbuild test/tags.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-tags-test.cjs && node /tmp/lenscript-tags-test.cjs && esbuild test/dictionary.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-dict-test.cjs && node /tmp/lenscript-dict-test.cjs && esbuild test/omm-merge.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-merge-test.cjs && node /tmp/lenscript-merge-test.cjs && esbuild test/omm-body.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-body-test.cjs && node /tmp/lenscript-body-test.cjs && esbuild test/omm-vertical.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-vertical-test.cjs && node /tmp/lenscript-vertical-test.cjs && esbuild test/omm-annotations.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-anno-test.cjs && node /tmp/lenscript-anno-test.cjs && esbuild test/omm-float.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-float-test.cjs && node /tmp/lenscript-float-test.cjs && esbuild test/omm-list-depth.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-listdepth-test.cjs && node /tmp/lenscript-listdepth-test.cjs && esbuild test/omm-merge-node.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-mergenode-test.cjs && node /tmp/lenscript-mergenode-test.cjs && esbuild test/omm-task.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-task-test.cjs && node /tmp/lenscript-task-test.cjs && esbuild test/omm-script-marker.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-scriptmarker-test.cjs && node /tmp/lenscript-scriptmarker-test.cjs && esbuild test/omm-box-spacing.test.ts --bundle --platform=node --format=cjs --outfile=/tmp/lenscript-boxspacing-test.cjs && node /tmp/lenscript-boxspacing-test.cjs"
+  },
+  "keywords": [
+    "obsidian",
+    "script",
+    "playwright",
+    "screenplay",
+    "canvas"
+  ],
+  "license": "AGPL-3.0",
+  "devDependencies": {
+    "@codemirror/commands": "^6.11.1",
+    "@types/node": "^20.11.0",
+    "builtin-modules": "3.3.0",
+    "esbuild": "0.24.0",
+    "obsidian": "^1.7.7",
+    "tslib": "^2.6.3",
+    "typescript": "^5.3.3"
+  }
+}

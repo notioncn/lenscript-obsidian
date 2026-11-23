@@ -1,0 +1,14 @@
+# 依赖与构建缓存
+node_modules/
+*.log
+
+# 本地备份 / 安装快照 / 打包产物
+*.bak
+install-backup-*/
+*.zip
+
+# macOS
+.DS_Store
+
+# 临时文件
+test/tmp/

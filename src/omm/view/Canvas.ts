@@ -1,0 +1,538 @@
+/**
+ * 平移 / 缩放 / 适应画布。
+ *
+ * 【只在容器上做一次 transform】——绝不逐节点改位置（第 2 章技术选型）。
+ * 节点自身的 translate 是布局坐标，平移缩放只动它们的父层，两者互不干扰。
+ *
+ * 指针、滚轮与手势后的点击都在 viewport 上处理，监听器数量与节点数量无关。
+ */
+
+import type { Box } from '../layout/types'
+import { normalizeViewport, type ViewportState } from '../settings/ViewPreferences'
+
+interface CanvasHooks {
+  onUserChange?(): void
+  onGestureStart?(): void
+  panNodes?(): boolean
+  /**
+   * 空白处左键拖动框选结束时回调。`box` 是内容坐标里的矩形（太小的拖动传 null），
+   * `additive` 表示按住 Shift（加选）。提供这个回调后，空白处左键拖动不再平移画布——
+   * 平移改用滚轮 / 中键 / 触屏手势。
+   */
+  onMarquee?(box: Box | null, additive: boolean): void
+}
+
+interface Point { x: number; y: number }
+
+const MIN_SCALE = 0.15
+const MAX_SCALE = 4
+/** 适应画布时四周留白。 */
+const FIT_PADDING = 40
+/** 适应画布不放大——内容很少时保持 100%，放大只会让人觉得糊。 */
+const MAX_FIT_SCALE = 1
+/** 视野跟随时目标离视口边缘的最小距离（M5 交付物写死 40px）。 */
+const FOLLOW_MARGIN = 40
+/**
+ * 程序性定位（适应画布 / 居中）的动画时长，受「优雅动画」开关控制（M10）。
+ *
+ * 比节点自己的 140ms 略长：视野要走的距离通常比单个节点远得多，
+ * 两者同时开跑时，视野稍慢一点看起来才像「镜头跟过去」而不是「画面被弹了一下」。
+ */
+const MOVE_MS = 180
+
+export class Canvas {
+  readonly viewport: HTMLElement
+  readonly content: HTMLElement
+
+  private tx = 0
+  private ty = 0
+  private scale = 1
+
+  private panPointer: number | null = null
+  /** 框选状态：起点（客户端坐标）与是否加选。 */
+  private marquee: { pointerId: number; sx: number; sy: number; additive: boolean } | null = null
+  private readonly marqueeEl: HTMLElement
+  private readonly touches = new Map<number, Point>()
+  private touchGesture = false
+  private suppressClickUntil = 0
+  private lastX = 0
+  private lastY = 0
+  private startX = 0
+  private startY = 0
+  private width = 0
+  private height = 0
+  private hiddenCenter: ViewportState | undefined
+  private readonly observer: ResizeObserver
+  private frame: number | null = null
+  /** 「优雅动画」开着吗（M10）。只影响程序性定位，手动平移/缩放永远是即时的。 */
+  private animated = false
+  /** 上一次写进 style 的 transition，避免每帧都往 DOM 里塞同一个字符串。 */
+  private transition = ''
+
+  /**
+   * @param onResize 视口尺寸变化后的回调。视图刚打开时容器尺寸还是 0，
+   *   「适应画布」得等这个回调来了才有意义。
+   */
+  constructor(host: HTMLElement, private readonly onResize?: () => void, private readonly hooks: CanvasHooks = {}) {
+    this.viewport = host.createDiv({ cls: 'om-viewport' })
+    // 可聚焦：跳转到编辑器之后要把焦点收回来，M5 的快捷键也挂在这上面
+    this.viewport.tabIndex = -1
+    this.content = this.viewport.createDiv({ cls: 'om-content' })
+    this.marqueeEl = this.viewport.createDiv({ cls: 'om-marquee is-hidden' })
+
+    // 容器尺寸缓存下来，省得每次适应画布都去读 clientWidth（会触发重排）
+    this.observer = new ResizeObserver((entries) => {
+      const rect = entries[0]?.contentRect
+      if (!rect) return
+      const changed = rect.width !== this.width || rect.height !== this.height
+      const center = this.snapshot() ?? this.hiddenCenter
+      this.width = rect.width
+      this.height = rect.height
+      if (changed && center && this.width > 0 && this.height > 0) {
+        this.tx = this.width / 2 - center.x * this.scale
+        this.ty = this.height / 2 - center.y * this.scale
+        this.applyNow(false)
+      }
+      this.hiddenCenter = this.width > 0 && this.height > 0 ? undefined : center
+      if (changed) this.onResize?.()
+    })
+    this.observer.observe(this.viewport)
+
+    // Capture sees both fingers before node dragging can claim them.
+    this.viewport.addEventListener('pointerdown', this.onPointerDown, true)
+    this.viewport.addEventListener('pointermove', this.onPointerMove, true)
+    this.viewport.addEventListener('pointerup', this.onPointerUp, true)
+    this.viewport.addEventListener('pointercancel', this.onPointerUp, true)
+    this.viewport.addEventListener('lostpointercapture', this.onLostCapture)
+    this.viewport.addEventListener('click', this.onClick, true)
+    this.viewport.addEventListener('dblclick', this.onClick, true)
+    this.viewport.addEventListener('wheel', this.onWheel, { passive: false })
+  }
+
+  destroy(): void {
+    this.observer.disconnect()
+    this.cancelGesture()
+    this.viewport.removeEventListener('pointerdown', this.onPointerDown, true)
+    this.viewport.removeEventListener('pointermove', this.onPointerMove, true)
+    this.viewport.removeEventListener('pointerup', this.onPointerUp, true)
+    this.viewport.removeEventListener('pointercancel', this.onPointerUp, true)
+    this.viewport.removeEventListener('lostpointercapture', this.onLostCapture)
+    this.viewport.removeEventListener('click', this.onClick, true)
+    this.viewport.removeEventListener('dblclick', this.onClick, true)
+    this.viewport.removeEventListener('wheel', this.onWheel)
+    if (this.frame !== null) window.cancelAnimationFrame(this.frame)
+  }
+
+  /** 「优雅动画」开关（M10）。视图每次绘制时对一下，改设置后下一次定位立即生效。 */
+  setAnimated(on: boolean): void {
+    this.animated = on
+    if (!on && this.transition) {
+      this.transition = ''
+      this.content.setCssStyles({ transition: '' })
+    }
+  }
+
+  /**
+   * 内容外接矩形 → 居中并缩放到看得全。
+   *
+   * @param animate 平滑移过去（还要「优雅动画」开着才算数）。首次适应画布必须传 false：
+   *   那时候上一个位置是原点，动画会让整张图从左上角飞进来
+   * @returns 是否真的执行了。容器尺寸还没量出来时返回 false，调用方应保留「待适应」标记。
+   */
+  fit(bounds: Box, animate = false): boolean {
+    if (bounds.w <= 0 || bounds.h <= 0 || this.width <= 0 || this.height <= 0) return false
+    const avail = { w: this.width - FIT_PADDING * 2, h: this.height - FIT_PADDING * 2 }
+    const s = clamp(
+      Math.min(avail.w / bounds.w, avail.h / bounds.h, MAX_FIT_SCALE),
+      MIN_SCALE,
+      MAX_SCALE,
+    )
+    this.scale = s
+    this.tx = centerTranslate(bounds.x * s, bounds.w * s, this.width)
+    this.ty = centerTranslate(bounds.y * s, bounds.h * s, this.height)
+    this.applyNow(animate)
+    return true
+  }
+
+  /**
+   * 把一块内容摆到屏幕正中（M10：展开 / 折叠后的视野跟随）。
+   *
+   * 【只平移不缩放】。折叠一下就把用户调好的缩放比例改掉，比看不见还烦人；
+   * 目标比视口还大时也照样居中——那时候中间那一段才是他刚操作的地方。
+   */
+  centerOn(box: Box, animate = false, minScale = MIN_SCALE): boolean {
+    if (this.width <= 0 || this.height <= 0) return false
+    // Search may raise a tiny whole-map scale to make its result readable.
+    // Ordinary navigation keeps the user's scale unchanged.
+    this.scale = clamp(Math.max(this.scale, minScale), MIN_SCALE, MAX_SCALE)
+    this.tx = centerTranslate(box.x * this.scale, box.w * this.scale, this.width)
+    this.ty = centerTranslate(box.y * this.scale, box.h * this.scale, this.height)
+    this.applyNow(animate)
+    return true
+  }
+
+  snapshot(): ViewportState | undefined {
+    if (this.width <= 0 || this.height <= 0) return undefined
+    return { scale: this.scale, x: (this.width / 2 - this.tx) / this.scale,
+      y: (this.height / 2 - this.ty) / this.scale }
+  }
+
+  /** Restore without a fit-then-jump frame; moved/deleted content gets a visible fallback. */
+  restore(raw: ViewportState, boxes: Iterable<Box>): boolean {
+    const state = normalizeViewport(raw)
+    if (!state || this.width <= 0 || this.height <= 0) return false
+    const nodes = [...boxes]
+    if (!nodes.length) return false
+    this.scale = state.scale
+    this.tx = this.width / 2 - state.x * this.scale
+    this.ty = this.height / 2 - state.y * this.scale
+    const visible = nodes.some(box => box.x * this.scale + this.tx < this.width &&
+      (box.x + box.w) * this.scale + this.tx > 0 && box.y * this.scale + this.ty < this.height &&
+      (box.y + box.h) * this.scale + this.ty > 0)
+    if (!visible) {
+      const nearest = nodes.reduce((best, box) =>
+        distanceTo(box, state) < distanceTo(best, state) ? box : best)
+      this.tx = centerTranslate(nearest.x * this.scale, nearest.w * this.scale, this.width)
+      this.ty = centerTranslate(nearest.y * this.scale, nearest.h * this.scale, this.height)
+    }
+    this.applyNow(false)
+    return true
+  }
+
+  /**
+   * 视口在屏幕上的矩形。拖拽时【开始读一次就够】，一次拖拽内它不会变——
+   * 逐帧读会白白触发强制重排（陷阱 5 的同类问题）。
+   */
+  viewportRect(): DOMRect {
+    return this.viewport.getBoundingClientRect()
+  }
+
+  /** 客户端坐标 → 布局坐标（撤掉本层的 translate 与 scale）。rect 由调用方缓存。 */
+  toContent(rect: DOMRect, clientX: number, clientY: number): { x: number; y: number } {
+    return {
+      x: (clientX - rect.left - this.tx) / this.scale,
+      y: (clientY - rect.top - this.ty) / this.scale,
+    }
+  }
+
+  /** 把键盘焦点收到导图上。preventScroll：别让浏览器顺手滚动外层容器。 */
+  focus(): void {
+    this.viewport.focus({ preventScroll: true })
+  }
+
+  /**
+   * 视野跟随（M5）：目标在屏幕外时【最小平移】把它带进来，四周留 margin。
+   *
+   * 只平移不缩放——新增一个节点就把用户的缩放比例改掉，比看不见还烦人。
+   */
+  ensureVisible(box: Box, margin = FOLLOW_MARGIN): void {
+    if (this.width <= 0 || this.height <= 0) return
+    const dx = shiftInto(
+      box.x * this.scale + this.tx,
+      (box.x + box.w) * this.scale + this.tx,
+      this.width,
+      margin,
+    )
+    const dy = shiftInto(
+      box.y * this.scale + this.ty,
+      (box.y + box.h) * this.scale + this.ty,
+      this.height,
+      margin,
+    )
+    if (dx !== 0 || dy !== 0) this.panBy(dx, dy, false)
+  }
+
+  zoomBy(factor: number): void {
+    this.zoomAt(factor, this.width / 2, this.height / 2)
+  }
+
+  /** 以视口内某点为锚点缩放——鼠标底下的内容不动。 */
+  zoomAt(factor: number, px: number, py: number): void {
+    if (!Number.isFinite(factor) || factor <= 0) return
+    const next = clamp(this.scale * factor, MIN_SCALE, MAX_SCALE)
+    if (next === this.scale) return
+    const k = next / this.scale
+    this.tx = px - (px - this.tx) * k
+    this.ty = py - (py - this.ty) * k
+    this.scale = next
+    this.apply()
+    this.hooks.onUserChange?.()
+  }
+
+  panBy(dx: number, dy: number, user = true): void {
+    if (!Number.isFinite(dx) || !Number.isFinite(dy)) return
+    this.tx += dx
+    this.ty += dy
+    this.apply()
+    if (user) this.hooks.onUserChange?.()
+  }
+
+  cancelGesture(): void {
+    this.endMarquee()
+    const ids = [...this.touches.keys()]
+    if (this.panPointer !== null) ids.push(this.panPointer)
+    if (this.touchGesture) this.suppressClickUntil = Date.now() + 500
+    this.touches.clear()
+    this.panPointer = null
+    this.touchGesture = false
+    for (const id of ids) this.release(id)
+    this.viewport.removeClass('is-panning')
+  }
+
+  // ── 事件 ────────────────────────────────────────────────────
+
+  private readonly onPointerDown = (e: PointerEvent): void => {
+    if (e.button !== 0 && e.button !== 1) return
+    const target = e.target as HTMLElement
+    if (target.closest('.om-editor')) return
+    if (e.pointerType === 'touch') {
+      if (this.touches.size === 0) this.suppressClickUntil = 0
+      this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (this.touches.size >= 2) {
+        this.touchGesture = true
+        this.panPointer = null
+        this.hooks.onGestureStart?.()
+        for (const id of this.touches.keys()) this.viewport.setPointerCapture(id)
+        this.viewport.addClass('is-panning')
+        e.preventDefault()
+        e.stopPropagation()
+        return
+      }
+    }
+    if (target.closest('.om-node') && !(e.pointerType === 'touch' && this.hooks.panNodes?.())) return
+    // 外框 / 概要本身是可点击的（打开编辑），不要把它当成空白去框选
+    if (target.closest('[data-anno]')) return
+    if (this.panPointer !== null) return
+    // 空白处左键拖动 = 框选（提供 onMarquee 时）。平移改用滚轮 / 中键 / 触屏手势。
+    if (e.button === 0 && e.pointerType !== 'touch' && this.hooks.onMarquee) {
+      this.focus()
+      this.marquee = { pointerId: e.pointerId, sx: e.clientX, sy: e.clientY, additive: e.shiftKey }
+      this.viewport.setPointerCapture(e.pointerId)
+      this.showMarquee(e.clientX, e.clientY)
+      e.preventDefault()
+      return
+    }
+    // 点空白也算「我在用导图」——键盘焦点收过来，否则快捷键要先点一下节点才生效
+    this.focus()
+    this.panPointer = e.pointerId
+    this.lastX = e.clientX
+    this.lastY = e.clientY
+    this.startX = e.clientX
+    this.startY = e.clientY
+    // Preserve the original click target for a tap on a locked node or its toggle.
+    if (e.pointerType !== 'touch') {
+      this.viewport.setPointerCapture(e.pointerId)
+      this.viewport.addClass('is-panning')
+    }
+  }
+
+  private readonly onPointerMove = (e: PointerEvent): void => {
+    if (this.marquee && this.marquee.pointerId === e.pointerId) {
+      this.showMarquee(e.clientX, e.clientY)
+      e.stopPropagation()
+      return
+    }
+    if (this.touches.has(e.pointerId)) {
+      const before = [...this.touches.values()]
+      this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY })
+      if (this.touches.size >= 2) {
+        const after = [...this.touches.values()]
+        const a = before[0]!, b = before[1]!, c = after[0]!, d = after[1]!
+        const distance = Math.hypot(a.x - b.x, a.y - b.y)
+        const next = Math.hypot(c.x - d.x, c.y - d.y)
+        const rect = this.viewportRect()
+        if (distance > 0 && next > 0) this.zoomAt(next / distance,
+          (a.x + b.x) / 2 - rect.left, (a.y + b.y) / 2 - rect.top)
+        this.panBy((c.x + d.x - a.x - b.x) / 2, (c.y + d.y - a.y - b.y) / 2)
+        e.preventDefault()
+        e.stopPropagation()
+        return
+      }
+    }
+    if (this.panPointer !== e.pointerId) return
+    if (e.pointerType === 'touch' && !this.touchGesture) {
+      if (Math.hypot(e.clientX - this.startX, e.clientY - this.startY) < 6) return
+      this.touchGesture = true
+      this.viewport.setPointerCapture(e.pointerId)
+      this.viewport.addClass('is-panning')
+    }
+    this.panBy(e.clientX - this.lastX, e.clientY - this.lastY)
+    this.lastX = e.clientX
+    this.lastY = e.clientY
+  }
+
+  private readonly onPointerUp = (e: PointerEvent): void => {
+    if (e.type === 'pointercancel') {
+      if (!this.touches.has(e.pointerId) && this.panPointer !== e.pointerId) return
+      const handled = this.touchGesture
+      this.cancelGesture()
+      if (handled) e.stopPropagation()
+      return
+    }
+    if (this.marquee && this.marquee.pointerId === e.pointerId) {
+      const additive = this.marquee.additive
+      const box = this.marqueeBox(e.clientX, e.clientY)
+      this.endMarquee()
+      this.release(e.pointerId)
+      this.hooks.onMarquee?.(box, additive)
+      e.stopPropagation()
+      return
+    }
+    if (this.touches.has(e.pointerId)) {
+      this.touches.delete(e.pointerId)
+      if (this.panPointer === e.pointerId) this.panPointer = null
+      this.release(e.pointerId)
+      if (this.touchGesture) {
+        this.suppressClickUntil = Date.now() + 500
+        e.stopPropagation()
+        const remaining = [...this.touches.entries()][0]
+        this.panPointer = remaining?.[0] ?? null
+        if (remaining) {
+          this.lastX = remaining[1].x
+          this.lastY = remaining[1].y
+        } else {
+          this.touchGesture = false
+          this.viewport.removeClass('is-panning')
+        }
+        return
+      }
+    }
+    if (this.panPointer !== e.pointerId) return
+    this.panPointer = null
+    this.release(e.pointerId)
+    this.viewport.removeClass('is-panning')
+  }
+
+  private readonly onLostCapture = (e: PointerEvent): void => {
+    if (e.target === this.viewport && (this.touches.has(e.pointerId) || this.panPointer === e.pointerId)) {
+      this.onPointerUp(e)
+    }
+  }
+
+  private readonly onClick = (e: MouseEvent): void => {
+    if (this.touchGesture || Date.now() < this.suppressClickUntil) {
+      e.preventDefault()
+      e.stopImmediatePropagation()
+    }
+  }
+
+  /** 框选矩形跟着指针走（屏幕坐标）。 */
+  private showMarquee(x: number, y: number): void {
+    const m = this.marquee
+    if (!m) return
+    const rect = this.viewport.getBoundingClientRect()
+    const left = Math.min(m.sx, x) - rect.left
+    const top = Math.min(m.sy, y) - rect.top
+    this.marqueeEl.removeClass('is-hidden')
+    this.marqueeEl.setCssStyles({
+      left: `${left}px`,
+      top: `${top}px`,
+      width: `${Math.abs(x - m.sx)}px`,
+      height: `${Math.abs(y - m.sy)}px`,
+    })
+  }
+
+  /** 屏幕坐标的框选矩形 → 内容坐标。太小视为一次单击，返回 null。 */
+  private marqueeBox(x: number, y: number): Box | null {
+    const m = this.marquee
+    if (!m) return null
+    const rect = this.viewport.getBoundingClientRect()
+    const a = this.toContent(rect, m.sx, m.sy)
+    const b = this.toContent(rect, x, y)
+    const box: Box = {
+      x: Math.min(a.x, b.x),
+      y: Math.min(a.y, b.y),
+      w: Math.abs(a.x - b.x),
+      h: Math.abs(a.y - b.y),
+    }
+    return box.w < 2 || box.h < 2 ? null : box
+  }
+
+  private endMarquee(): void {
+    this.marquee = null
+    this.marqueeEl.addClass('is-hidden')
+  }
+
+  private release(id: number): void {
+    if (this.viewport.hasPointerCapture(id)) this.viewport.releasePointerCapture(id)
+  }
+
+  private readonly onWheel = (e: WheelEvent): void => {
+    e.preventDefault()
+    if (e.ctrlKey || e.metaKey) {
+      const rect = this.viewport.getBoundingClientRect() // 每次滚轮一次，不是每节点一次
+      this.zoomAt(Math.exp(-e.deltaY / 400), e.clientX - rect.left, e.clientY - rect.top)
+    } else {
+      this.panBy(-e.deltaX, -e.deltaY)
+    }
+  }
+
+  // ── 提交 ────────────────────────────────────────────────────
+
+  /** 合并同一帧内的多次变换，避免拖拽时每个 pointermove 都写一次样式。 */
+  private apply(): void {
+    if (this.frame !== null) return
+    this.frame = window.requestAnimationFrame(() => {
+      this.frame = null
+      this.write(false)
+    })
+  }
+
+  /**
+   * 程序性定位【立刻】写，不等下一帧（M10：消除闪屏）。
+   *
+   * 节点的 DOM 是同步写完的，视口变换却等一帧的话，中间那一帧画的是
+   * 「新内容 + 旧视野」——打开笔记时能看见整张图先出现在左上角再跳到中间。
+   */
+  private applyNow(animate: boolean): void {
+    if (this.frame !== null) {
+      window.cancelAnimationFrame(this.frame)
+      this.frame = null
+    }
+    this.write(animate)
+  }
+
+  private write(animate: boolean): void {
+    const transition = animate && this.animated ? `transform ${MOVE_MS}ms ease-out` : ''
+    if (this.transition !== transition) {
+      this.content.setCssStyles({ transition })
+      this.transition = transition
+    }
+    this.content.setCssStyles({
+      transform: `translate(${this.tx}px, ${this.ty}px) scale(${this.scale})`,
+    })
+  }
+}
+
+function distanceTo(box: Box, point: Point): number {
+  return Math.hypot(box.x + box.w / 2 - point.x, box.y + box.h / 2 - point.y)
+}
+
+/**
+ * 一个轴上把长 `size` 的内容摆到 `viewSize` 正中所需的平移量。
+ *
+ * 输入都是【屏幕像素】（布局坐标已乘过 scale）。适应画布与居中共用它，
+ * 免得同一个公式写两遍、改一处漏一处。
+ */
+export function centerTranslate(lo: number, size: number, viewSize: number): number {
+  return (viewSize - size) / 2 - lo
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, v))
+}
+
+/**
+ * 一个轴上把 [lo, hi] 挪进 [margin, size - margin] 所需的最小位移。已经在里面就返回 0。
+ *
+ * 目标比可视区还大时（超长节点 / 缩放很大）优先对齐起始边——
+ * 看得见开头比看得见结尾有用。
+ */
+export function shiftInto(lo: number, hi: number, size: number, margin: number): number {
+  const min = margin
+  const max = size - margin
+  if (hi - lo >= max - min) return lo > min || hi < max ? min - lo : 0
+  if (lo < min) return min - lo
+  if (hi > max) return max - hi
+  return 0
+}
