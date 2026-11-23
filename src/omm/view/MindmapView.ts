@@ -2880,15 +2880,19 @@ export class MindmapView extends ItemView {
       y: (box?.y ?? 0) + (box?.h ?? 0) / 2,
     }
 
-    const index = tree.root.children.filter((c) => c !== node).length
-    let plan: EditPlan
-    try {
-      plan = moveSubtree(tree, id, null, index, this.parseOptions())
-    } catch (err) {
-      this.report(err)
-      return
+    // 本来就是根节点（比如把普通绪论节点拖到空白处）时，文档序没得重排，
+    // 只需要补一个 %%float%%，否则 applyEdit 的「空计划」会让它原地弹回去。
+    if (node.depth > 1) {
+      const index = tree.root.children.filter((c) => c !== node).length
+      let plan: EditPlan
+      try {
+        plan = moveSubtree(tree, id, null, index, this.parseOptions())
+      } catch (err) {
+        this.report(err)
+        return
+      }
+      if (!this.applyEdit(plan, (t) => t.byId.get(id) ?? null)) return
     }
-    if (!this.applyEdit(plan, (t) => t.byId.get(id) ?? null)) return
     const moved = this.tree
     if (!moved) return
 
