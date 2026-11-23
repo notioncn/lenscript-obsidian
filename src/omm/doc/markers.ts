@@ -178,11 +178,18 @@ function build(view: EditorView): DecorationSet {
   try {
     const builder = new RangeSetBuilder<Decoration>()
     const doc = view.state.doc
+    // 同一个长行可能被拆进两个 visibleRange；重复扫描会让同一个位置加两次装饰
+    let lastLineFrom = -1
     for (const visible of view.visibleRanges) {
       let pos = visible.from
       while (pos <= visible.to) {
         const line = doc.lineAt(pos)
         if (line.from > visible.to) break
+        if (line.from === lastLineFrom) {
+          pos = line.to + 1
+          continue
+        }
+        lastLineFrom = line.from
         const text = line.text
         const hits = annotationHits(text)
         const firstTrailing = trailingFrom(text, hits)
