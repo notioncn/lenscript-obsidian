@@ -103,6 +103,19 @@ function isDescendantOf(node: MindNode, maybeAncestor: MindNode): boolean {
 }
 
 /**
+ * 目标是不是 `node` 的上级（父、祖父……）。
+ *
+ * 拖回上级时「成为子节点」要么原地不动、要么只是换层，合并才是有意义的动作，
+ * 所以视图层会把合并摆进菜单让人选，而不是按默认设置直接搬。
+ */
+export function targetIsAncestor(node: MindNode, targetId: string): boolean {
+  for (let p = node.parent; p; p = p.parent) {
+    if (p.id === targetId) return true
+  }
+  return false
+}
+
+/**
  * 落点 → `moveSubtree` 的参数。非法落点返回 null。
  *
  * 非法的只有一类：目标是被拖节点自身或它的后代（附录 A.7.4 第 1 步）。

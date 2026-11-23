@@ -73,7 +73,7 @@ import { Annotations } from './Annotations'
 import { AnnotationModal } from './AnnotationModal'
 import { Canvas } from './Canvas'
 import { Connectors } from './Connectors'
-import { DragController, resolveDrop, subtreeIds, type DropResult, type DropTarget } from './DragController'
+import { DragController, resolveDrop, subtreeIds, targetIsAncestor, type DropResult, type DropTarget } from './DragController'
 import { RelationDrag } from './RelationDrag'
 import { InlineEditor, BodyInlineEditor, type CommitNext } from './Editor'
 import { exportMap, ExportSizeError } from './exportMap'
@@ -2763,16 +2763,36 @@ export class MindmapView extends ItemView {
     // 只有「落到节点身上」才需要选择动作；上 / 下边缘仍然是普通重排
     if (target.zone === 'into' && target.id !== null && target.id !== dragId) {
       const parent = node.parent
-      const ontoParent = parent && parent.depth > 0 && parent.id === target.id
-      if (ontoParent) {
-        // 拖回自己的父节点身上：成为子节点没有意义，只剩合并
-        if (node.children.length === 0) {
-          this.showDropMenu(dragId, target.id, x, y, false)
+      const intoParent = !!parent && parent.depth > 0 && parent.id === target.id
+      const targetNode = tree.byId.get(target.id)
+      // 拖回自己的上级（父 / 祖父……）：往自己所在的分支里再搬一次没有新意，合并才是有意义的动作
+      const intoAncestor = !!targetNode && targetNode.depth > 0 && targetIsAncestor(node, targetNode.id)
+      const childless = node.children.length === 0
+      // 独立块还没有确定的结构位置，落到节点上时「成为子节点」和「合并」都说得通
+      const independent = !!node.annotations?.float
+      const action = this.host.settings.dropAction
+
+      if (childless && (intoAncestor || independent)) {
+        // 用户明确设了「合并」，就别多问
+        if (action === 'mergeNote') {
+          this.mergeInto(dragId, target.id, 'note')
           return
         }
-      } else if (node.children.length === 0) {
+        if (action === 'mergeText') {
+          this.mergeInto(dragId, target.id, 'text')
+          return
+        }
+        // 拖回上级时「成为子节点」只是换层 / 原地重排，默认设置直接搬走会让人摸不着合并入口；
+        // 父节点再「成为子节点」等于排到末尾，没有意义，菜单里就只留合并
+        this.showDropMenu(dragId, target.id, x, y, !intoParent)
+        return
+      }
+
+      if (intoAncestor) {
+        // 带子节点不能合并（要先给后代找去处），但设了「合并」的人得被告知一声，别以为合并成功了
+        if (action === 'mergeNote' || action === 'mergeText') new Notice(t('notice.mergeNeedsChildless'))
+      } else if (childless) {
         // 有子节点的节点不能合并（要先给后代找去处），直接成为子节点
-        const action = this.host.settings.dropAction
         if (action === 'ask') {
           this.showDropMenu(dragId, target.id, x, y, true)
           return

@@ -34,6 +34,7 @@ const zh = {
   'search.clear': '清除高亮',
   'notice.operationAborted': '导图操作未完成：{0}',
   'notice.listNodesRequired': '列表项已被忽略，目标位置的层级会超过标题的 6 层上限。',
+  'notice.mergeNeedsChildless': '合并只能用于没有子节点的节点；这次已按结构落点移动。',
   'notice.copiedToClipboard': '（已复制到剪贴板）',
 
   // ── 视图（MindmapView）──
@@ -306,6 +307,7 @@ const en: Record<MsgKey, string> = {
   'notice.operationAborted': 'Mindmap action not completed: {0}',
   'notice.listNodesRequired':
     'List items are ignored, so the target position would exceed the 6-level heading limit.',
+  'notice.mergeNeedsChildless': 'Only nodes without children can be merged; moved it to the structural drop instead.',
   'notice.copiedToClipboard': '(copied to clipboard)',
 
   // ── View (MindmapView) ──

@@ -5,7 +5,7 @@
 import assert from "node:assert/strict"
 import { parse } from "../src/omm/core/parser"
 import { layout } from "../src/omm/layout"
-import { hitTest } from "../src/omm/view/DragController"
+import { hitTest, resolveDrop, targetIsAncestor } from "../src/omm/view/DragController"
 
 let passed = 0
 let failed = 0
@@ -100,6 +100,22 @@ test("没有独立节点时 hitTest 行为不变", () => {
   ])
   const hit = hitTest(["a"], boxes, 100, 5, "h")
   assert.equal(hit.id, "a")
+})
+
+test("拖回上级：父 / 祖父都算上级，兄弟不算", () => {
+  const tree = parse(
+    ["# 根", "", "## A", "", "### A1", "", "#### A1a", "", "## B", ""].join("\n"),
+    OPTS,
+  )
+  const a = byText(tree, "A")
+  const a1 = byText(tree, "A1")
+  const a1a = byText(tree, "A1a")
+  const b = byText(tree, "B")
+  assert.equal(targetIsAncestor(a1a, a1.id), true)
+  assert.equal(targetIsAncestor(a1a, a.id), true)
+  assert.equal(targetIsAncestor(a1a, b.id), false)
+  // 落到上级身上是合法移动（不会成环），菜单里的「成为子节点」才有意义
+  assert.equal(resolveDrop(tree, a1a.id, { id: a.id, zone: "into" })?.parentId, a.id)
 })
 
 console.log(`\n${passed} passed, ${failed} failed`)
